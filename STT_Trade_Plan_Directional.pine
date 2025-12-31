@@ -1,0 +1,2034 @@
+//@version=6
+// MJ 28-Dec-2025
+strategy('STT Trade Plan Directional', overlay=true, initial_capital=1000, default_qty_type=strategy.fixed, default_qty_value=200, process_orders_on_close=true, pyramiding=0)
+import TradingView/ta/11
+
+// Setup the ability to have a label with the name of the script on the chart and use it in logging/debug statements
+scriptName = input.string('STT Trade Directional Strategy', 'Script Title')
+showLabel = input.bool(false, "Show label on chart?")
+
+if showLabel
+    lbl = label.new(bar_index, high, scriptName, style=label.style_label_down)
+    label.set_text(lbl, scriptName)
+    label.set_x(lbl, bar_index)
+    label.set_y(lbl, high)
+
+// Build the list of possible TraderPost subscription names
+// tp_subs = ["Webull Webull-Bot", "Robinhood RH-Bot", "TradeStation CaSH TradeStation", "TradeStation Paper TradeStation-Bot", "TraderPost Paper Simple Long"]
+// used for debugging when sending json to TraderPost (TP) via webhooks, can be included in the json for visibility/inspection in the notification on TP
+// note: although TP docs claim you can select the subscribed broker based on the name for a strategy with multiple tp_subscriptions, this doesn't work as intended and may have been depricated by TP
+enum TpBroker
+    BlastAll
+    Webull
+    Robinhood
+    TradeStationCash
+    TradeStationPaper
+    TraderPostPaper
+
+enum TmaTriggerType
+    Crossing
+    Band
+    Slope
+    Hybrid
+
+enum TradeDirection
+    Long
+    Short
+    Both
+
+enum PositionDirection
+    LONG
+    SHORT
+    NONE
+var PositionDirection posDir = PositionDirection.NONE
+
+enum TS_TYPE
+    DOLLAR
+    PERCENT
+
+// ============================================================================
+// INPUT PARAMETERS
+// ============================================================================
+
+//Reguired Indications
+primary_entry_type = input.string('Price', 'Entry Type', ['Price','Breakout','TMA-Crossing', 'VWAP-Crossing', 'All', 'Any'], group = 'Trade Entry Triggers', confirm=true, display=display.data_window)
+//additional_entry_type_logic = input.string('or', 'Entry Type Addition Logical Method', ['and','or'], group = 'Trade Entry Triggers', confirm=true, display=display.data_window)
+additional_entry_type_logic = input.string('or', 'Entry Type Addition Logical Method', ['and','or'], group = 'Trade Entry Triggers', confirm=true, display=display.data_window)
+mainTriggerPriceType = input.string('Close', 'Price Trigger Type', options = ['Close', 'Open', 'High', 'Low', 'Median', 'Typical', 'Weighted'], group = 'Trade Entry Triggers', display=display.data_window)
+bool oneSignalPerDay  = input.bool(true, "Limit Only One Trade Per Day", group = 'Trade Entry Triggers', confirm=true, display=display.data_window)
+bool closeDaily = input.bool(false, "Enable Daily Close", group = 'Trade Entry Triggers', tooltip='When enabled all trades will be exited at time selected.',confirm=true, display=display.data_window)
+tradeDirectionSelected = input.enum(TradeDirection.Long, title='Trade types allowed', group = 'Trade Entry Triggers', tooltip = 'Type of trades Long, Short or both that backtesting and alert will get triggered.')
+int dailyEntryWindowStartHour = input.int(8, title="Hour (ET) to begine allowing trade entry", minval = 4, maxval = 19)
+int dailyEntryWindowStartMinute = input.int(30, title="Minutes after Hour to begin allowing trade entry", minval = 0, step = 15, maxval = 45)
+int dailyExitWindowStartHour = input.int(15, title="Hour (ET) to force daily trade exits", minval = 11, maxval = 19)
+int dailyExitWindowStartMinute = input.int(45, title="Minutes after Hour to force trade exits", minval = 0, step = 15, maxval = 45)
+
+int triggerHour   = input.int(9, "Trigger Entry Enable Hour (ET)", group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
+int triggerMinute = input.int(45, "Trigger Entry Enable Minute", group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
+
+// SuperNova LowFloat Breakout Settings
+bool usePreMarketHigh = input.bool(false, "Include Pre-Market High", group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
+float floatSize         = input.float(3.0, "Max Float Size (M)", step=0.1, group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
+float volumeMultiplier = input.float(5.0, "Volume Multiplier", step=0.1, group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
+float percentGain      = input.float(50.0, "Min Percent Gain (%)", step=0.1, group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
+
+//TMA, VWAP, and other inclusion conditional settings
+additional_entry_type = input.string('None', 'Trade Entry Additional Type', ['None','Breakout','TMA-Crossing', 'VWAP-Crossing'], group = 'Trade Entry Triggers', confirm=true, display=display.data_window)
+tma_entry_required = input.bool(false, title="Entry Requires TMA bullish state", group = "Trade Additional Triggers", tooltip='Overrides the slection list triggers, requiring TMA bullish state to also be true for entry.', display=display.data_window)
+vwap_entry_required = input.bool(false, title="Entry Requires Price Above VWAP", group = "Trade Additional Triggers", tooltip='Overrides the slection list triggers, requiring Price above VWAP to also be true for entry.', display=display.data_window)
+vwap_exit_required = input.bool(false, title="Exit Requires Price Below VWAP", group = "Trade Additional Triggers", tooltip='Overrides the slection list triggers, requiring Price below VWAP to also be true for exit.', display=display.data_window)
+tma_exit_required = input.bool(false, title="Exit Requires TMA bearish state", group = "Trade Additional Triggers", tooltip='Overrides the slection list triggers, requiring TMA bearish state to also be true for exit.', display=display.data_window)
+manual_price_only = input.bool(false, title="Use Price Only (disables all others)", group = "Trade Additional Triggers", tooltip='Overrides the slection list triggers, requiring Manual Entry Price values for Entry, StopLoss, and Take Profit, disabling all other conditions.', display=display.data_window)
+tmaCrossingType = input.enum(TmaTriggerType.Crossing, title='TMA trigger type', group='Trade Additional Triggers')
+// Stop related settings
+primary_stopLoss_type = input.string('Range-Based', 'Primary Stop Type', ['Range-Based','Trailing-Stop','Fixed-Price','TMA-Crossing','Any'], group = 'Trade StopLoss Triggers', confirm=true)
+additional_stopLoss_type_logic = input.string('or', 'Stop Type Addition Logical Method', ['and','or'], group = 'Trade StopLoss Triggers', confirm=true, display=display.data_window)
+additional_stopLoss_type = input.string('None', 'Additional Stop Type', ['Range-Based','Trailing-Stop','Fixed-Price','None' ], group = 'Trade StopLoss Triggers', confirm=true, display=display.data_window)
+primary_takeProfit_type = input.string('Range-Based', 'Primary Take Profit Type', ['Range-Based','Trailing-StopProfit','Fixed-Price','TMA-Crossing', 'Any'], group = 'Trade TakeProfit Triggers', confirm=true, display=display.data_window)
+additional_takeProfit_type_logic = input.string('or', 'TakeProfit Type Addition Logical Method', ['and','or'], group = 'Trade TakeProfit Triggers', confirm=true, display=display.data_window)
+additional_takeProfit_type = input.string('None', 'Additional Take Profit Type', ['Range-Based','Trailing-StopProfit','Fixed-Price','TMA-Crossing','None'], group = 'Trade TakeProfit Triggers', confirm=true, display=display.data_window)
+tp_amount = input.float(0.07, 'Take Profit $1 Range Start ', step = 0.01, minval = 0.0, group = "Trade TakeProfit Triggers", confirm=false, tooltip='Initial range based take profit value - Amount above entry price at $1. will scale out for higher prices.', display=display.data_window)
+
+// Trailing Stop Settings
+rangeBased = input.bool(true, title="Use Range Based Stop/Profits", group = "Range Stop/Profit", tooltip='Uses range adjustments to set initial stopLoss and takeProfit.', display=display.data_window)
+rangeBasedInit = input.float(0.08, 'Long starting value at $1', step = 0.01, minval = 0.0, group = "Range Stop", tooltip='Overrides Long trades trailing stop value if active.', display=display.data_window)
+shortBasedInit = input.float(0.12, 'Short starting value at $1', step = 0.01, minval = 0.0, group = "Range Stop", tooltip='Overrides Short trades trailing stop value if active.', display=display.data_window)
+ts_amount = input.float(0.07, 'Trailing Stop (0.0=disabled)', step = 0.01, minval = 0.0, group = "Dynamic Trailing Stop", confirm=true, tooltip='O.0 causes disabling, when type=% .10=10%, when type=$ .10=ten cents', display=display.data_window)
+ts_min_profit = input.float(0.05, 'Trailing Stop Minimum Profit', step = 0.01, minval = 0.0, group = "Dynamic Trailing Stop", confirm=true, tooltip='When taking profit require the inputed minimum value (uses $ or % based on trailing stop type.) ', display=display.data_window)
+ts_type = input.string('$', 'Stop Type', ['$','%'], group = 'Dynamic Trailing Stop', confirm=true, display=display.data_window)
+TS_TYPE intStopType = ts_type == '$' ? TS_TYPE.DOLLAR : TS_TYPE.PERCENT
+// Deal with bad data lookups for price if returns are out of the expected range
+priceAdjust = input.bool(true, "Limit to under $1000 close.", 'Assumes any close/open/etc price must be less than 1000 or it needs to be scaled down.', display=display.data_window)
+// Manual related settings
+manual_entry_price = input.float(0.01, 'Manual Entry Price', minval = 0.01, step = 0.01, group = "Manual Entry Conditions")
+manual_exitStop_price = input.float(0.08, 'Absolute StopLoss Exit Below Entry Price Amount', minval = 0.01, step = 0.01, group = "Manual Entry Conditions", display=display.data_window)
+manual_exitProfit_price = input.float(0.99, 'Absolute Take Profit Above Entry Amount', minval = 0.05, step = 0.01, group = "Manual Entry Conditions", display=display.data_window)
+manual_exitStop_override = input.bool(true, title="Use Exit StopLoss Below Price.", group = "Manual Entry Conditions")
+manual_exitProfit_override = input.bool(true, title="Take profit at specific amount above price.", group = "Manual Entry Conditions")
+
+// VWAP Settings
+vwap_stdDev = input.int(55, 'Deviation Lookback Length', minval = 1, group = "VWAP Settings", display=display.data_window)
+vwap_multiplier = input.float(1.5, 'Multiplier', minval = 0.5, step = 0.5, group = "VWAP Settings", display=display.data_window)
+// MAIN (SLOW) Bands Settings
+mainPeriod = input.int(24, 'Period', minval = 1, group = 'MA MAIN (SLOW) Bands', display=display.data_window)
+mainPriceType = input.string('Close', 'Price', options = ['Close', 'Open', 'High', 'Low', 'Median', 'Typical', 'Weighted'], group = 'MA MAIN (SLOW) Bands', display=display.data_window)
+mainDeviations = input.float(1.7, 'Bands Multiplier', minval = 0.1, step = 0.1, group = 'MA MAIN (SLOW) Bands', display=display.data_window)
+// FAST Bands Settings
+fastPeriod = input.int(8, 'Period', minval = 1, group = 'MA FAST Bands', display=display.data_window) 
+fastPriceType = input.string('Weighted', 'Price', options = ['Close', 'Open', 'High', 'Low', 'Median', 'Typical', 'Weighted'], group = 'MA FAST Bands', display=display.data_window)
+fastDeviations = input.float(3.4, 'Bands Multiplier', minval = 0.1, step = 0.1, group = 'MA FAST Bands', display=display.data_window)
+// Signal Settings
+signalOffset = input.int(5, 'Signal Arrow Offset (pips)', minval = 0, group = 'Signal Settings', display=display.data_window)
+// Alert Settings
+enableAlerts = input.bool(true, 'Enable Alerts', group = 'Alert Settings', display=display.data_window)
+enableAlertsEnter = input.bool(true, 'Enable Buy Signal', group = 'Alert Settings', display=display.data_window)
+enableAlertsExit = input.bool(true, 'Enable Sell Signal', group = 'Alert Settings', display=display.data_window)
+x_debug = input.bool(true, title='Debug', group = 'Alert Settings', tooltip='Enables JSON info logging.', display=display.data_window)
+x_debug_deep = input.bool(false, title='Deep Debug', group = 'Alert Settings', tooltip='Enables extra logging to show variables.', display=display.data_window)
+x_debug_bull = input.bool(false, title='Deep Bull Debug', group = 'Alert Settings', tooltip='Enables extra logging to show bull related variables.', display=display.data_window)
+x_debug_bear = input.bool(false, title='Deep Bear Debug', group = 'Alert Settings', tooltip='Enables extra logging to show bear related variables.', display=display.data_window)
+x_debug_signals = input.bool(false, title='Deep Signal Debug', group = 'Alert Settings', tooltip='Enables extra logging to show signal related variables.', display=display.data_window)
+x_debug_price = input.bool(false, title='Deep Price Action Debug', group = 'Alert Settings', tooltip='Enables extra logging to show bearprices, stops, and profits related variables.', display=display.data_window)
+
+debug_interval = input.string('5', options=['1','2','5','10', '15', '20', '30', '60', '120', '240', '480', '1440'], title='Debug Interval', group='Alert Settings', tooltip='For debugging that hits every tick, only show it the number of minutes apart.')
+
+x_backtest_startDate = input.time(timestamp("2025-10-01 00:00"), title='Backtesting First Day', group = 'Alert Settings', tooltip='Limits strategy backtesting to start from the selected time', display=display.data_window)
+
+// Trade Message JSON Settings
+
+x_tp_subscription = input.bool(false, title='Include TP Subscription Name', group = 'TradePost JSON Values', tooltip='Includes a trader post subscription name to target in the strategy.', display=display.data_window)
+// x_tp_subscriptionName = input.string("Robinhood-Bot", title="TP Subscription Name", options = ["Webull-Bot", "Robinhood-Bot", "TradeStation Cash", "TradeStation Paper", "TraderPost Paper"],group = 'TradePost JSON Values') 
+
+x_tpBroker = input.enum(TpBroker.Robinhood, title="TP Subscription Name",group = 'TradePost JSON Values')
+
+
+x_quantity = input.float(50.00, 'Dollars Per Trade', minval = 20.00, step = 1.0, group = 'TradePost JSON Values', display=display.data_window)
+x_setTargets = input.bool(defval=false, title='Include Stops', group = 'TradePost JSON Values', display=display.data_window)
+x_tp = input.float(25, 'Take Profit Percent', minval = 1.00, step = 1.0, group = 'TradePost JSON Values', display=display.data_window)
+x_sl = input.float(10, 'Stop Loss Percent', minval = 1.00, step = 1.0, group = 'TradePost JSON Values', display=display.data_window)
+x_orderEnterGap = input.float(0.03, 'Limit Order Buy Add', minval = 0.00, step = 0.01, group = 'Limit Order Volatility Adjustment', display=display.data_window)
+x_orderExitGap = input.float(0.03, 'Limit Order Sell Subtract', minval = 0.00, step = 0.01, group = 'Limit Order Volatility Adjustment', display=display.data_window)
+
+// 
+// ============================================================================
+// User Define Types (UDT) and Variables
+// ============================================================================
+type breakoutConfig
+    float floatSize = 3.0
+    float volumeMultiplier = 5.0
+    float percentGain      = 50.0
+    int triggerHour   = 9
+    int triggerMinute = 45
+    bool usePreMarketHigh = false
+    int triggerTime = na //time("America/New_York", year, month, dayofmonth)
+    float dayOpen = na
+    float dayHigh = na
+    bool breakoutSignalActive = false
+    bool breakoutFiredToday = false
+
+makeBreakoutConfig(float fs, float vm, float pg, int th, int tm, bool upmh) =>
+    tgt = timestamp("America/New_York", year, month, dayofmonth, th, tm)
+    breakoutConfig.new(fs,vm,pg,th,tm,upmh,tgt,na, na, false, false)
+
+
+// Store Inputs in easy to pass/reference structure
+// Entry trigger flags
+type EntryConfig
+    bool manual_entry_enabled      = false
+    bool tma_entry_enabled         = true
+    bool tma_entry_required        = false
+    bool vwap_entry_enabled        = false
+    bool vwap_entry_required       = false
+    bool entry_all_required        = false
+    bool manual_entry_required     = false
+    bool breakout_entry_enabled    = false
+// Create the Constructor factory function for EntryConfig to be used in switch logic
+makeEntryConfig(bool manual_entry_enabled, bool tma_entry_enabled, bool tma_entry_required, bool vwap_entry_enabled, bool vwap_entry_required, bool entry_all_required, bool manual_entry_required, bool breakout_entry_enabled) =>
+    EntryConfig.new(
+        manual_entry_enabled,
+        tma_entry_enabled,
+        tma_entry_required,
+        vwap_entry_enabled,
+        vwap_entry_required,
+        entry_all_required,
+        manual_entry_required,
+        breakout_entry_enabled
+    )
+dumpEntryConfig(EntryConfig curEntry) =>
+    if not na(curEntry)
+        log.info('dumpEntryConfig: manual_entry_enabled:{0}, tma_entry_enabled:{1}, tma_entry_required:{2}:,vwap_entry_enabled:{3}, vwap_entry_required:{4}, entry_all_required:{5}, manual_entry_required:{6}, breakout_entry_enabled:{7}', curEntry.manual_entry_enabled,
+        curEntry.tma_entry_enabled,
+        curEntry.tma_entry_required,
+        curEntry.vwap_entry_enabled,
+        curEntry.vwap_entry_required,
+        curEntry.entry_all_required,
+        curEntry.manual_entry_required,
+        curEntry.breakout_entry_enabled
+        )
+    else
+        log.info('dumpEntryConfig: curEntry == na')
+// Store the Exit Flags and create a constructor factory function
+type ExitConfig
+    bool tma_exit_enabled = true
+    bool tma_exit_required = false
+    bool vwap_exit_required = false
+makeExitConfig(bool tma_exit_enabled, bool tma_entry_required, bool vwap_exit_required) =>
+    ExitConfig.new(tma_exit_enabled, tma_entry_required, vwap_exit_required)
+dumpExitConfig(ExitConfig curExit) =>
+    if not na(curExit)
+        log.info('dumpExitConfig: tma_exit_enabled:{0}, tma_exit_required:{1}, vwap_exit_required:{2}', curExit.tma_exit_enabled, curExit.tma_exit_required, curExit.vwap_exit_required)
+    else
+        log.info('dumpExitConfig: curExit == na')
+
+
+// create the StopLoss type and constructor factory function
+type exitConfigSL
+    bool tma_exit_enabled = true
+    bool tma_exit_required = false
+    bool manual_exitStop_enabled = false
+    bool trailingStop_exit_enabled = false
+    bool rangeBased_SL_enabled = false
+makeExitConfigSL(bool tma_exit_enabled,bool tma_exit_required, bool manual_exitStop_enabled, bool trailingStop_exit_enabled,  bool rangeBased_SL_enabled ) =>
+    exitConfigSL.new(tma_exit_enabled,tma_exit_required,manual_exitStop_enabled, trailingStop_exit_enabled, rangeBased_SL_enabled )
+dumpExitConfigSL(exitConfigSL curExitConfigSL) =>
+    if not na(curExitConfigSL)
+        log.info('dumpExitConfigSL: tma_exit_enabled:{0}, tma_exit_required:{1}, manual_exitStop_enabled:{2}, trailingStop_exit_enabled:{3}, rangeBased_SL_enabled:{4}', curExitConfigSL.tma_exit_enabled,curExitConfigSL.tma_exit_required,curExitConfigSL.manual_exitStop_enabled, curExitConfigSL.trailingStop_exit_enabled, curExitConfigSL.rangeBased_SL_enabled )
+    else
+        log.info('dumpExitConfigSL: curExitConfigSL == na')
+// Generate the TakeProfit type and constructor factory function
+type exitConfigTP
+    bool rangeBased_TP_enabled = false
+    bool manual_exitProfit_enabled = false
+    bool trailingProfit_enabled = false
+    bool tma_TP_crossing_enabled = true
+    bool tma_exit_required = false
+makeExitConfigTP(bool rangeBased_TP_enabled,bool manual_exitProfit_enabled, bool trailingProfit_enabled, bool tma_TP_crossing_enabled, bool tma_exit_required ) =>
+    exitConfigTP.new(rangeBased_TP_enabled,manual_exitProfit_enabled,trailingProfit_enabled, tma_TP_crossing_enabled, tma_exit_required)
+dumpExitConfigTP(exitConfigTP curConfigTP) =>
+    if not na(curConfigTP)
+        log.info('dumpExitConfigTP: rangeBased_TP_enabled:{0}, manual_exitProfit_enabled:{1}, trailingProfit_enabled:{2}, tma_TP_crossing_enabled:{3}, tma_exit_required:{4}', curConfigTP.rangeBased_TP_enabled, curConfigTP.manual_exitProfit_enabled, curConfigTP.trailingProfit_enabled, curConfigTP.tma_TP_crossing_enabled, curConfigTP.tma_exit_required)
+    else
+        log.info('dumpExitConfigTP: curConfigTP == na')
+type exitConfigShort
+    bool rangeBased_TP_enabled = false
+    bool manual_exitProfit_enabled = false
+    bool trailingProfit_enabled = false
+    bool tma_TP_crossing_enabled = true
+    bool tma_exit_required = false
+    bool tma_exit_enabled = true
+    bool manual_exitStop_enabled = false
+    bool trailingStop_exit_enabled = false
+    bool rangeBased_SL_enabled = false
+makeExitConfigShort(bool rangeBased_TP_enabled,bool manual_exitProfit_enabled, bool trailingProfit_enabled, bool tma_TP_crossing_enabled, bool tma_exit_required, bool tma_exit_enabled, bool manual_exitStop_enabled, bool trailingStop_exit_enabled, bool rangeBased_SL_enabled) =>
+    exitConfigShort.new(rangeBased_TP_enabled,manual_exitProfit_enabled,trailingProfit_enabled, tma_TP_crossing_enabled, tma_exit_required, tma_exit_enabled, manual_exitStop_enabled, trailingStop_exit_enabled, rangeBased_SL_enabled)
+dumpExitConfigShort(exitConfigShort curConfigShort) =>
+    if not na(curConfigShort)
+        log.info('dumpExitConfigShort: rangeBased_TP_enabled:{0}, manual_exitProfit_enabled:{1}, trailingProfit_enabled:{2}, tma_TP_crossing_enabled:{3}, tma_exit_required:{4}', curConfigShort.rangeBased_TP_enabled, curConfigShort.manual_exitProfit_enabled, curConfigShort.trailingProfit_enabled, curConfigShort.tma_TP_crossing_enabled, curConfigShort.tma_exit_required)
+        log.info('dumpExitConfigShort: tma_exit_enabled:{0}, manual_exitStop_enabled:{1}, trailingStop_exit_enabled:{2}, rangeBased_SL_enabled:{3}', curConfigShort.tma_exit_enabled, curConfigShort.manual_exitStop_enabled, curConfigShort.trailingStop_exit_enabled, curConfigShort.rangeBased_SL_enabled)
+    else
+        log.info('dumpExitConfigShort: curConfigShort == na')
+//Store the inputs into UDT's
+type tmaConfigInfo
+    float tma_main = 0.0
+    float tma_upperMain = 0.0
+    float tma_upperFast = 0.0
+    float tma_lowerMain = 0.0
+    float tma_lowerFast = 0.0
+    float tma_mainPeriod = 0.0
+    float tma_fastDeviations = 0.0
+    float tma_mainDeviations = 0.0
+    float tma_fastPeriod = 0.0
+    string tma_mainPriceType = 'close'
+    string tma_fastPriceType = 'close'
+maketmaConfigInfo(float tma_main,float tma_upperMain,float tma_upperFast,float tma_lowerMain,float tma_lowerFast,float tma_mainPeriod,float tma_fastDeviations,float tma_mainDeviations,
+    float tma_fastPeriod,string tma_mainPriceType, string tma_fastPriceType) =>
+    tmaConfigInfo.new(tma_main, tma_upperMain, tma_upperFast, tma_lowerMain, tma_lowerFast, tma_mainPeriod, tma_fastDeviations, tma_mainDeviations, tma_fastPeriod, tma_mainPriceType, tma_fastPriceType)
+dumpTMAConfigInfo(tmaConfigInfo curTMAConfigInfo) =>
+    if not na(curTMAConfigInfo)
+        log.info('dumpTMAConfigInfo: tma_main:{0}, tma_upperMain:{1}, tma_upperFast:{2}, tma_lowerMain:{3}, tma_lowerFast:{4}, tma_mainPeriod:{5}, tma_fastDeviations:{6}, '+
+            'tma_mainDeviation{7}, tma_fastPeriod:{8}, tma_mainPriceType:{9}, tma_fastPriceType:{10}', curTMAConfigInfo.tma_main, curTMAConfigInfo.tma_upperMain, curTMAConfigInfo.tma_upperFast,
+            curTMAConfigInfo.tma_lowerMain, curTMAConfigInfo.tma_lowerFast, curTMAConfigInfo.tma_mainPeriod, curTMAConfigInfo.tma_fastDeviations, curTMAConfigInfo.tma_mainDeviations,curTMAConfigInfo.tma_fastPeriod, curTMAConfigInfo.tma_mainPriceType, curTMAConfigInfo.tma_fastPriceType)
+    else
+        log.info('dumpTMAConfigInfo: cureTMAConfigInfo == na')
+type vwapConfigInfo
+    float vwap_main = 0.0
+    float vwap_deviation = 0.0
+    int vwap_stdDev = 0
+    float vwap_upper = 0.0
+    float vwap_lower = 0.0
+    float vwap_multiplier = 0.0
+makevwapConfigInfo(int x_vwap_stdDev, float x_vwap_multiplier, float x_ePrice) =>
+    x_vwap_main = ta.vwap(hlc3)
+    x_vwap_deviation = ta.stdev(x_ePrice - x_vwap_main, x_vwap_stdDev)
+    x_vwap_upper = x_vwap_main + x_vwap_multiplier * x_vwap_deviation
+    x_vwap_lower = x_vwap_main - x_vwap_multiplier * x_vwap_deviation
+    vwapConfigInfo.new(x_vwap_main,x_vwap_deviation,x_vwap_stdDev,x_vwap_upper,x_vwap_lower, x_vwap_multiplier)
+dumpVwapInfoConfig(vwapConfigInfo vwapInfo) =>
+    if not na(vwapInfo)
+        log.info('dumpVwapInfoConfig: wap_main:{0}, wap_deviation:{1}, vwap_stdDev:{2}, vwap_upper:{3}, vwap_lower:{4},  vwap_multiplier:{5}', vwapInfo.vwap_main,vwapInfo.vwap_deviation,vwapInfo.vwap_stdDev,vwapInfo.vwap_upper,vwapInfo.vwap_lower, vwapInfo.vwap_multiplier)
+    else
+        log.info('dumpVwapInfoConfig: vwapConfigInfo == na')
+// Entry Input Settings
+type ShortEntryInputs
+    string entry_type = 'TMA-Crossing'
+    bool rangeBased = false
+    float rangeBasedInit = 0.08
+    float manual_entry_price = 0.0
+    EntryConfig entryFlags
+makeShortEntryInputs(TmaTriggerType et, bool rb, float rbi, float manPrice, EntryConfig EConf) =>
+    string entry_type = switch et
+        TmaTriggerType.Crossing  => "TMA-Crossing"
+        TmaTriggerType.Slope     => "TMA-Slope"
+        TmaTriggerType.Band      => "TMA-Band"
+        TmaTriggerType.Hybrid    => "TMA-Hybrid"
+    ShortEntryInputs.new(entry_type, rb, rbi, manPrice, EConf)
+dumpShortInputs(ShortEntryInputs curSEI) =>
+    if not na(curSEI)
+        log.info('dumpShortEntryInputs: entry_type:{0}, rangeBase:{1}, rangeBasedInit:{2}, manual_entry_price {3}', curSEI.entry_type, curSEI.rangeBased, curSEI.rangeBasedInit, curSEI.manual_entry_price)
+    else
+        log.info('dumpShortEntryInputs: ShortEntryInputs == na')
+type LongEntryInputs
+    string primary_entry_type = 'Price'
+    string additional_entry_type = 'TMA-Crossing'
+    string additional_entry_type_logic = 'and'
+    bool vwap_entry_required = true
+    float manual_entry_price = 0.0
+    EntryConfig entryFlags
+makeLongtEntryInputs(string et, string add_type, string type_logic, bool vwapReq, float manPrice, EntryConfig EConf) =>
+    LongEntryInputs.new(et, add_type, type_logic, vwapReq, manPrice, EConf)
+dumpLongEntryInputs(LongEntryInputs curLongEntryInputs) =>
+    if not na(curLongEntryInputs)
+        log.info('dumpLongEntryInputs: primary_entry_type:{0}, additional_entry_type:{1}, additional_entry_type_logic:{2}, vwap_entry_required:{3}, manual_entry_price:{4}',
+        curLongEntryInputs.primary_entry_type, curLongEntryInputs.additional_entry_type, curLongEntryInputs.additional_entry_type_logic, curLongEntryInputs.vwap_entry_required, curLongEntryInputs.manual_entry_price)
+        if not na(curLongEntryInputs.entryFlags)
+            dumpEntryConfig(curLongEntryInputs.entryFlags)
+        else
+            log.info('dumpLongEntryInputs: LongEntryInputs.entryFlags == na')
+    else
+        log.info('dumpLongEntryInputs: curLongEntryInputs == na')
+// Stop Loss settings
+type StopLossInputs
+    string primary_stopLoss_type = 'Range-Based'
+    string additional_stopLoss_type_logic = 'or'
+    string additional_stopLoss_type = 'None'
+    bool vwap_exit_required = false
+    float manual_exitStop_price = 0.08
+    float ts_amount = 0.08
+    exitConfigSL stopLossFlags
+dumpStopLossInputs(StopLossInputs curSLI) =>
+    if not na(curSLI)
+        log.info('dumpStopLossInputs: primay_stopLoss_type:{0}, additional_stopLoss_type_logic:{1}, additional_stopLoss_type:{2}, vwap_exit_required:{3}, manual_exitStop_price:{4}, ts_amount:{5}',
+        curSLI.primary_stopLoss_type, curSLI.additional_stopLoss_type_logic, curSLI.additional_stopLoss_type, curSLI.vwap_exit_required, curSLI.manual_exitStop_price, curSLI.ts_amount)
+        if not na(curSLI.stopLossFlags)
+            log.info('dumpStopLossInputs: StopLossInputs.stopLossFlags:')
+            dumpExitConfigSL(curSLI.stopLossFlags)
+        else
+            log.info('dumpStopLossInputs: StopLossInputs.stopLossFlags == na')
+    else
+        log.info('dumpStopLossInputs: StopLossInputs == na')
+// Take Profit settings
+type TakeProfitInputs
+    string primary_takeProfit_type = 'Range-Based'
+    string additional_takeProfit_type_logic = 'or'
+    string additional_takeProfit_type = 'None'
+    bool vwap_exit_required = false
+    float manual_exitProfit_price = 0.99
+    float tp_amount = 0.10
+    exitConfigTP takeProfitFlags
+    bool ts_min_profit_enabled = false
+dumpTakeProfitInputs(TakeProfitInputs curTP) =>
+    if not na(curTP)
+        log.info('dumpTakeProfitInputs: primary_takeProfit_type:{0}, additional_takeProfit_type_logic:{1}, additional_takeProfit_type:{2}, vwap_exit_required:{3}, manual_exitProfit_price:{4}, tp_amount:{5}, take_profit_min:{6} takeProfitFlags: ',
+        curTP.primary_takeProfit_type, curTP.additional_takeProfit_type_logic, curTP.additional_takeProfit_type, curTP.vwap_exit_required, curTP.manual_exitProfit_price, curTP.tp_amount, curTP.ts_min_profit_enabled)
+        if not na(curTP.takeProfitFlags)
+            log.info('dumpTakeProfitInputs: TakeProfitInputs.takeProfitFlags:')
+            dumpExitConfigTP(curTP.takeProfitFlags)
+        else
+            log.info('dumpTakeProfitInputs: TakeProfitInputs.takeProfitFlags == na')
+    else
+        log.info('dumpTakeaProfitInputs: TakeProfitInputs == na')
+type TrailingStopInputs
+    string ts_type = '$'
+    bool rangeBased = false
+    float rangeBasedInit = 0.08
+    float ts_amount = 0.07
+    float ts_min_profit = 0.05
+    float trailing_stop = 0.0
+    bool ts_min_profit_enabled = false
+    float trailing_stop_min_profit = 0.0
+dumpTrailingStopInputs(TrailingStopInputs curTSL) =>
+    if not na(curTSL)
+        log.info('dumpTrailingStopInputs: ts_type:{0}, rangeBase:{1}, rangeBasedInit:{2}, ts_amount:{3}, ts_min_profit:{4}, trailing_stop:{5}, ts_min_profit_enabled:{6}, trailing_stop_min_profit:{7}', curTSL.ts_type, curTSL.rangeBased, curTSL.rangeBasedInit, curTSL.ts_amount, curTSL.ts_min_profit, curTSL.trailing_stop, curTSL.ts_min_profit_enabled, curTSL.trailing_stop_min_profit)
+    else
+        log.info('dumpTrailingStopInputs: TrailingStopInputs == na')
+type ShortStopInputs
+    string exit_type = 'Crossing'
+    bool rangeBased = false
+    float rangeBasedInit = 0.08
+    float ts_amount = 0.07
+    float ts_min_profit = 0.05
+    float trailing_stop = 0.0
+    bool ts_min_profit_enabled = false
+    float trailing_stop_min_profit = 0.0
+    exitConfigShort exitShortFlags = na
+makeShortStopInputs(TmaTriggerType et, bool rb, float rbi, float tsa, float tsm, float ts, bool tmpe, float tsmp, exitConfigShort ecs) =>
+    string entry_type = switch et
+        TmaTriggerType.Crossing  => "TMA-Crossing"
+        TmaTriggerType.Slope     => "TMA-Slope"
+        TmaTriggerType.Band      => "TMA-Band"
+        TmaTriggerType.Hybrid    => "TMA-Hybrid"
+    ShortStopInputs.new(entry_type,rb,rbi,tsa,tsm,ts,tmpe,tsmp, ecs)
+dumpShortStopInputs(ShortStopInputs curSSI) =>
+    if not na(curSSI)
+        log.info('dumpShortStopInputs: exit_type:{0}, rangeBase:{1}, rangeBasedInit:{2}, ts_amount:{3}, ts_min_profit:{4}, trailing_stop:{5}, ts_min_profit_enabled:{6}, trailing_stop_min_profit:{7}', curSSI.exit_type, curSSI.rangeBased, curSSI.rangeBasedInit, curSSI.ts_amount, curSSI.ts_min_profit, curSSI.trailing_stop, curSSI.ts_min_profit_enabled, curSSI.trailing_stop_min_profit)
+        log.info('dumpShortStopInputs: exitShortFlags : ')
+        dumpExitConfigShort(curSSI.exitShortFlags)
+    else
+        log.info('dumpShortStopInputs: ShortStopInputs == na')
+type ExitInputs
+    StopLossInputs SLI = na
+    TakeProfitInputs TPI = na
+    ShortStopInputs SSI = na
+dumpExitInputs(ExitInputs curEI) =>
+    if not na(curEI)
+        if not na(curEI.SLI)
+            log.info('dumpExitInputs: ExitInputs.SLI :')
+            dumpStopLossInputs(curEI.SLI)
+        else 
+            log.info('dumpExitInputs: ExitInputs.SLI == na')
+        if not na(curEI.TPI)
+            log.info('dumpExitInputs: ExitInputs.TPI: ')
+            dumpTakeProfitInputs(curEI.TPI)
+        else
+            log.info('dumpExitInputs: ExitInputs.TPI == na')
+        if not na(curEI.SSI)
+            log.info('dumptExitInputs: ExitInputs.SSI : ')
+            dumpShortStopInputs(curEI.SSI)
+        else
+            log.info('dumpExitInputs: ExitInputs.SSI == na')
+    else
+        log.info('dumpExitInputs: ExitInputs == na')
+
+pad2(x) =>
+    x < 10 ? "0" + str.tostring(x) : str.tostring(x)
+
+// --------------- UDT Invocations ---------------------------
+// Create the primary entry config trigger iablevaraible using defaults
+EntryConfig entryConf = EntryConfig.new(false,false, false,false,false, false, false,false)
+switch primary_entry_type
+    'Price'         => entryConf.manual_entry_enabled := true
+    'TMA-Crossing'  => entryConf.tma_entry_enabled := true
+    'VWAP-Crossing' => entryConf.vwap_entry_enabled := true
+    'Breakout'      => entryConf.breakout_entry_enabled := true
+    'All'           => makeEntryConfig(true,true,true,true,true,true,true, true)
+// Create the main entry config trigger varaiable based on the joining of primary and additional selected options
+switch additional_entry_type
+    'TMA-Crossing'  => entryConf.tma_entry_enabled := true
+    'VWAP-Crossing' => entryConf.vwap_entry_enabled := true
+    'Breakout' => entryConf.breakout_entry_enabled := true
+entryConf := (manual_price_only ? makeEntryConfig(true,false,false,false,false,false,true, false) : entryConf)
+//Create the Stop Loss UDT based on primay and additional selected options
+var exitConfSL = exitConfigSL.new()// Generate the primary StopLoss based on the selected input options
+exitConfSL.tma_exit_required := tma_exit_required
+// Set enabled flags based on selecting inputs`
+switch primary_stopLoss_type
+    'Range-Based'   => exitConfSL.rangeBased_SL_enabled := true
+    'Trailing-Stop' => exitConfSL.trailingStop_exit_enabled := true
+    'Fixed-Price'   => exitConfSL.manual_exitStop_enabled := true
+    'TMA-Crossing'  => exitConfSL.tma_exit_enabled := true
+    'Any'           => exitConfSL := makeExitConfigSL(true, false, true, true, true)
+// set enabled flags based on additional inputs
+switch additional_stopLoss_type
+    'Range-Based'   => exitConfSL.rangeBased_SL_enabled := true
+    'Trailing-Stop' => exitConfSL.trailingStop_exit_enabled := true
+    'Fixed-Price'   => exitConfSL.manual_exitStop_enabled := true
+    'TMA-Crossing'  => exitConfSL.tma_exit_enabled := true
+// catch tma-crossing edge case as second option required with a single primary indicator (not Any), or set it to the global flag to enforce tma crossing
+exitConfSL.tma_exit_required := additional_stopLoss_type == 'TMA-Crossing' and additional_stopLoss_type_logic == 'and' and not (primary_stopLoss_type == 'Any') ? true : tma_exit_required
+// reset if the manual entry only flag is set    
+exitConfSL := (manual_price_only ? makeExitConfigSL(false,false,true,false,false) : exitConfSL)
+// Create the Take Profit Exit Conf UDT
+exitConfTP = exitConfigTP.new()
+// Generate the primary TakeProfit variable based on the selected input options
+exitConfTP.tma_exit_required := tma_exit_required
+switch primary_takeProfit_type 
+    'Range-Based'   => exitConfTP.rangeBased_TP_enabled := true 
+    'Trailing-StopProfit' => exitConfTP.trailingProfit_enabled := true
+    'Fixed-Price'   => exitConfTP.manual_exitProfit_enabled := true
+    'TMA-Crossing'  => exitConfTP.tma_TP_crossing_enabled := true
+    'Any'           => exitConfTP := makeExitConfigTP(true, true, true, true, false)
+exitConfTP := (manual_price_only ? makeExitConfigTP(false,true,false,false,false) : exitConfTP)
+// Generate the TakeProfit master variable based on the joined primary and additional selected options
+switch additional_takeProfit_type
+    'Range-Based'   => exitConfTP.rangeBased_TP_enabled := true
+    'Trailing-StopProfit' => exitConfTP.trailingProfit_enabled := true
+    'Fixed-Price'   => exitConfTP.manual_exitProfit_enabled := true
+    'TMA-Crossing'  => exitConfTP := makeExitConfigTP(exitConfTP.rangeBased_TP_enabled, exitConfTP.manual_exitProfit_enabled, exitConfTP.trailingProfit_enabled, true, true ? additional_takeProfit_type_logic == 'and' : exitConfTP.tma_exit_required)
+// catch tma-crossing edge case as second option required with a single primary indicator (not Any), or set it to the global flag to enforce tma crossing    
+exitConfTP.tma_exit_required := additional_takeProfit_type == 'TMA-Crossing' and additional_takeProfit_type_logic == 'and' and not (primary_takeProfit_type == 'Any') ? true : tma_exit_required
+exitConfTP := (manual_price_only ? makeExitConfigTP(false,true,false,false,false) : exitConfTP)
+exitConfShort = makeExitConfigShort(exitConfTP.rangeBased_TP_enabled, exitConfTP.manual_exitProfit_enabled, exitConfTP.trailingProfit_enabled, true, true, true,exitConfSL.manual_exitStop_enabled, exitConfSL.trailingStop_exit_enabled,exitConfSL.rangeBased_SL_enabled)
+//----------- Global Variable Initialization --------------------
+// populate the variables for usage with logic and currentPosition tracking
+bool isNewLogBar = ta.change(time(debug_interval)) != 0
+bool rtBarStatus =  barstate.isrealtime and barstate.isconfirmed
+bool inTestingRange = time >= x_backtest_startDate 
+//tma_exit_enabled if SL or TP exit enabled it
+bool tma_exit_enabled = exitConfSL.tma_exit_enabled or exitConfTP.tma_TP_crossing_enabled
+bool tmaExitRequired = tma_exit_required
+float trailing_stop = ts_amount
+float trailing_stop_min_profit = ts_min_profit
+bool ts_min_profit_enabled = ts_min_profit > 0 ? true : false
+
+
+
+
+
+// initialize each and then override (disabling other options) if manual_price only is ticked
+ExitConfig exitConf = makeExitConfig(tma_exit_enabled and not manual_price_only, (exitConfSL.tma_exit_required or exitConfTP.tma_exit_required or tma_exit_required) and not manual_price_only, vwap_exit_required and not manual_price_only)
+exitConf := manual_price_only ? makeExitConfig(false, false, false) : exitConf
+TrailingStopInputs ts_inputs = TrailingStopInputs.new(ts_type, rangeBased and not manual_price_only, rangeBasedInit, ts_amount, ts_min_profit, 0.0, ts_min_profit_enabled and not manual_price_only, 0.0)
+ts_inputs := manual_price_only ? TrailingStopInputs.new('Fixed-Price', false, rangeBasedInit, ts_amount, ts_min_profit, 0.0, false, 0.0) : ts_inputs
+LongEntryInputs entryInputs_long = makeLongtEntryInputs(primary_entry_type, additional_entry_type, additional_entry_type_logic, 
+    vwap_entry_required, manual_entry_price, entryConf)
+entryInputs_long := manual_price_only ? makeLongtEntryInputs('Fixed-Price', 'None', 'and', false, manual_entry_price, entryConf ) : entryInputs_long
+ShortEntryInputs entryInputs_short = makeShortEntryInputs(tmaCrossingType, rangeBased, shortBasedInit, manual_entry_price, entryConf)
+StopLossInputs stopLoss_inputs = StopLossInputs.new(primary_stopLoss_type, additional_stopLoss_type_logic, additional_stopLoss_type, vwap_exit_required and not manual_price_only, manual_exitStop_price, ts_amount, exitConfSL)
+stopLoss_inputs := manual_price_only ? StopLossInputs.new('Fixed-Price', 'and', 'None', false, manual_exitStop_price, ts_amount, exitConfSL) : stopLoss_inputs
+TakeProfitInputs takeProfit_inputs = TakeProfitInputs.new(primary_takeProfit_type, additional_takeProfit_type_logic, additional_takeProfit_type, vwap_exit_required and not manual_price_only, manual_exitProfit_price, tp_amount, exitConfTP, ts_min_profit_enabled)
+takeProfit_inputs := manual_price_only ? TakeProfitInputs.new('Fixed-Price', 'and', 'None', false, manual_exitProfit_price, tp_amount, exitConfTP, ts_min_profit_enabled) : takeProfit_inputs
+ShortStopInputs exit_inputs_short = makeShortStopInputs(tmaCrossingType, rangeBased,shortBasedInit,ts_amount, ts_min_profit, ts_amount, ts_min_profit_enabled, trailing_stop_min_profit, exitConfShort)
+ExitInputs exit_inputs = ExitInputs.new(stopLoss_inputs, takeProfit_inputs, exit_inputs_short)
+var breakoutConfig breakoutConf = makeBreakoutConfig(floatSize, volumeMultiplier, percentGain, triggerHour, triggerMinute, usePreMarketHigh)
+// dailyExitStartTime = timestamp(syminfo.timezone, year, month, dayofmonth, dailyExitWindowStartHour, dailyExitWindowStartMinute)
+// dailyEntryStartTime = timestamp(syminfo.timezone, year, month, dayofmonth, dailyEntryWindowStartHour, dailyEntryWindowStartMinute)
+
+dayStart = time("D")
+dailyExitStartTime = dayStart + (dailyExitWindowStartHour * 60 + dailyExitWindowStartMinute) * 60 * 1000
+dailyEntryStartTime = dayStart + (dailyEntryWindowStartHour * 60 + dailyEntryWindowStartMinute) * 60 * 1000
+//entrySessionStr = str.format("{0:02d}{1:02d}-{2:02d}{3:02d}", dailyEntryWindowStartHour, dailyEntryWindowStartMinute, dailyExitWindowStartHour, dailyExitWindowStartMinute)
+entrySessionStr = pad2(dailyEntryWindowStartHour) + pad2(dailyEntryWindowStartMinute) + "-" + pad2(dailyExitWindowStartHour)  + pad2(dailyExitWindowStartMinute)
+//bool inDailyRange = time >= dailyEntryStartTime and time_close <= dailyExitStartTime 
+inSession = not na(time(timeframe.period, entrySessionStr))
+bool inDailyRange = inSession // and time >= dailyEntryStartTime and time_close <= dailyExitStartTime
+// inTestingRange := inTestingRange and inDailyRange
+var dailyLimitReached = false
+shortEnabled = false
+longEnabled = true
+tpManualPrice  = exit_inputs.TPI.manual_exitProfit_price
+tsManualPrice  = exit_inputs.SLI.manual_exitStop_price
+slManualPrice = exit_inputs.SLI.manual_exitStop_price
+shortEnabled := switch tradeDirectionSelected
+    TradeDirection.Short    => true
+    TradeDirection.Both     => true
+    => false
+
+longEnabled := switch tradeDirectionSelected
+    TradeDirection.Long   => true
+    TradeDirection.Both    => true
+    => false
+
+bool isNewDay = ta.change(time("D")) != 0
+var bool eodExitFiredToday = false
+// Daily reset
+if isNewDay
+    breakoutConf := makeBreakoutConfig(floatSize, volumeMultiplier, percentGain, triggerHour, triggerMinute, usePreMarketHigh)
+    dailyLimitReached := false
+    eodExitFiredToday := false
+// clear the daily single limit flag if it is not enabled via inputs, the enter section sets dailyLimitReached to true on every entry to make it enforced and prevent a race condition
+// if previous bar set the dailyLimitedReached flag and the oneSignalPerDay input is set to enable (true), keep the state until reset by isNewDay, otherwise 
+// set back to false - i.e. ture and true = true, true and false = false, false and false = false, false and true = false 
+dailyLimitReached := dailyLimitReached and oneSignalPerDay 
+// Entry Flags
+const int ENTRY_MANUAL      = 1       // 0b000000001 manual entry only
+const int ENTRY_TMACROSS    = 2       // 0b000000010 tma crossing entry allowed
+const int ENTRY_VWAPCROSS   = 4       // 0b000000100 vwap crossing entry allowed
+const int ENTRY_VWAPBULL    = 8      // 0b000001000 vwap below price for long, above for short
+const int ENTRY_VWAPREQ    = 16     // 0b000010000 vwap required
+const int ENTRY_TMABULL     = 32     // 0b000100000 tma in buy/bull range
+const int ENTRY_TMAREQ     = 64     // 0b001000000 tma required
+const int ENTRY_BREAKOUT    = 128    // 0b010000000
+const int ENTRY_ANY         = 256    // 0b100000000
+
+int entryFlags = (entryConf.manual_entry_enabled or manual_price_only ? ENTRY_MANUAL : 0) +
+     (entryConf.tma_entry_enabled ? ENTRY_TMACROSS : 0  ) +
+     (entryConf.vwap_entry_enabled ? ENTRY_VWAPCROSS: 0 ) +
+     (entryConf.vwap_entry_enabled ? ENTRY_VWAPBULL : 0 ) +
+     (entryConf.vwap_entry_required ? ENTRY_VWAPREQ : 0) +
+     (entryConf.tma_entry_enabled ? ENTRY_TMABULL : 0 )   +
+     (entryConf.tma_entry_required ? ENTRY_TMAREQ : 0 ) +
+     (entryConf.breakout_entry_enabled ? ENTRY_BREAKOUT : 0) +
+     ((primary_entry_type == 'ANY' or additional_entry_type == 'ANY') and not entryConf.manual_entry_enabled ? ENTRY_ANY : 0)
+// Take Profit Flags
+const int TP_MANUAL = 1       // 0b000000001
+const int TP_RANGE  = 2       // 0b000000010
+const int TP_TRAIL  = 4       // 0b000000100
+
+// Trailing Stop / Stop Loss Flags
+const int TSL_MANUAL = 8      // 0b000001000
+const int TSL_RANGE  = 16     // 0b000010000
+const int TSL_TRAIL  = 32     // 0b000100000
+
+const int SL_MANUAL  = 64     // 0b001000000
+const int SL_RANGE   = 128    // 0b010000000
+const int SL_TRAIL   = 256    // 0b100000000
+const int TMA_EXIT   = 512    // 0b1000000000
+                              // 1024 0b10000000000
+
+// === BASE TMA/VWAP SETTINGS ===
+
+float initStop = ts_inputs.rangeBasedInit
+bool vwap_InBuyRange = false
+bool vwap_InSellRange = false
+bool tma_InEntryRange = false
+bool tma_InExitRange = false
+bool tma_EnterInRange = false
+
+int exitFlags = 
+     (exit_inputs.TPI.takeProfitFlags.manual_exitProfit_enabled ? TP_MANUAL : 0) +
+     ((exit_inputs.TPI.takeProfitFlags.rangeBased_TP_enabled or exit_inputs.SSI.exitShortFlags.rangeBased_TP_enabled) ? TP_RANGE : 0) +
+     ((exit_inputs.TPI.takeProfitFlags.trailingProfit_enabled or exit_inputs.SSI.exitShortFlags.trailingProfit_enabled) ? TP_TRAIL : 0) +
+     ((exit_inputs.SLI.stopLossFlags.manual_exitStop_enabled or exit_inputs.SSI.exitShortFlags.manual_exitStop_enabled) ? TSL_MANUAL : 0) +
+     ((exit_inputs.SLI.stopLossFlags.rangeBased_SL_enabled or exit_inputs.SSI.exitShortFlags.rangeBased_SL_enabled) ? TSL_RANGE : 0) +
+     ((exit_inputs.SLI.stopLossFlags.trailingStop_exit_enabled or exit_inputs.SSI.exitShortFlags.trailingStop_exit_enabled) ? TSL_TRAIL : 0) +
+     ((exit_inputs.SLI.stopLossFlags.manual_exitStop_enabled or exit_inputs.SSI.exitShortFlags.manual_exitProfit_enabled) ? SL_MANUAL : 0) +
+     ((exit_inputs.SLI.stopLossFlags.rangeBased_SL_enabled or exit_inputs.SSI.exitShortFlags.rangeBased_SL_enabled) ? SL_RANGE : 0) +
+     ((exit_inputs.SLI.stopLossFlags.trailingStop_exit_enabled or exit_inputs.SSI.exitShortFlags.trailingStop_exit_enabled) ? SL_TRAIL : 0)+
+     ((exitConfSL.tma_exit_enabled or exitConfTP.tma_TP_crossing_enabled or entryConf.tma_entry_enabled or exitConfSL.tma_exit_enabled or exitConfTP.tma_TP_crossing_enabled) ? TMA_EXIT : 0)
+
+
+type signalSettings
+    bool takeProfitSignal = false
+    bool takeProfitMinSignal = false
+    bool rangeStopLossSignal = false
+    bool manualEntrySignal = false
+    bool fixedStopLossSignal = false
+    bool manualExitProfitSignal = false
+    bool manualExitSignal = false
+    bool trailingStopLossSignal = false
+    bool stopSignal = false
+    bool tma_InSellRange = false
+    bool tma_InBuyRange = false
+    bool tma_CrossedExit = false
+    bool vwap_InSellRange = false
+    bool vwap_InBuyRange = false
+    bool vwap_CrossedExit = false
+    bool rangeCrossedExit = false
+    bool rangeCrossedEntry = false
+    bool canEnter = false
+    bool canExit = false
+    bool bearSignal = false
+    bool bearEntrySignal = false
+    bool bullSignal = false
+    bool bullEnabled = false
+    bool bullCross = false
+    bool bearCross = false
+    bool entryCross = false
+    bool bearEnabled = false
+    bool tradeActive = false
+    bool breakoutSignal = false
+    bool dailyLimitReached = false
+    bool eodExitSignal = false
+    bool tmaExitLong = false
+    bool tmaExitShort = false
+    bool tmaEntryLong = false
+    bool tmaEntryShort = false
+
+// Postion tracking
+type Position
+    bool active         = false
+    float entry         = 0.0
+    float quantity      = 0.0
+    float takeProfit    = 0.0
+    float minProfit     = 0.0
+    float stopLoss      = 0.0
+    float trailingStop  = 0.0
+    bool x_tp_set       = false
+    bool x_sl_set       = false
+    bool ts_set         = false
+    signalSettings signals = na
+    PositionDirection direction    = na
+    int elementId = 0
+makeCurrentPosition(bool active,float entry,float quantity,float takeProfit,float minProfit,float stopLoss,float trailingStop,bool x_tp_set,bool x_sl_set,bool ts_set, PositionDirection PD, int eid) =>
+   Position.new(active,entry,quantity,takeProfit,minProfit,stopLoss,trailingStop,x_tp_set,x_sl_set,ts_set, signalSettings.new(), PD, 0)
+
+// Build or extract the currentPosition array and object
+var Position[] CPLArray = array.new<Position>()
+var Position[] CPSArray = array.new<Position>()
+pos     = strategy.position_size
+prevPos = strategy.position_size[1]
+
+added    = pos > prevPos
+reduced  = pos < prevPos and pos != 0
+flattened = pos == 0 and prevPos != 0
+
+Position CPL = na // Position.new()
+Position CPS = na
+tradeActive = false
+if array.size(CPLArray) > 0 and not na(CPLArray)
+    // existing Long trade element in array, grab the last one,
+    // update with current state, and either set it back to the same spot if not exiting, or use it for pushing as new
+    CPL := array.get(CPLArray, array.size(CPLArray) - 1)
+    tradeActive := CPL.active
+    CPL.direction := PositionDirection.LONG
+    // CPL.signals.tradeActive := tradeActive
+    if x_debug_signals and isNewLogBar
+        log.info('Long-Signal : Existing CPL with signalSettings already set.')
+else
+    // no existing Long trades recorded in the array, create a new potential trade to store signals/calculations/etc as they are discovered
+    // NO, this is not needed, leaving it as na because the Positon UDT only needs to exist if entry occurs
+    // creating it was only needed for debugging
+    //Despite the avove, it needs to exist for some of the logic to used UDT's that reference subsection
+    CPL := Position.new()
+    CPL.active := false
+    CPL.signals := signalSettings.new()
+    CPL.elementId := 0
+    CPL.direction := PositionDirection.LONG
+
+// Perform the same setup and check for short positions
+if array.size(CPSArray) > 0 and not na(CPSArray)
+    // existing Short trade element in array, grab the last one,
+    // update with current state, and either set it back to the same spot if not exiting, or use it for pushing as new
+    CPS := array.get(CPSArray, array.size(CPSArray) - 1)
+    tradeActive := tradeActive or CPS.active
+    CPS.direction := PositionDirection.SHORT
+    // CPS.signals.tradeActive := tradeActive
+    CPS.elementId := array.size(CPSArray) - 1
+    if x_debug_signals and isNewLogBar
+        log.info('Signal-Short : Existing CPS with signalSettings already set.')
+else
+    CPS := Position.new()
+    CPS.active := false
+    CPS.signals := signalSettings.new()
+    CPS.elementId := 0
+    CPL.direction := PositionDirection.SHORT
+// Reset per bar values to be re-checked
+CPL.signals := signalSettings.new()
+CPS.signals := signalSettings.new()
+CPL.direction := PositionDirection.LONG
+CPS.direction := PositionDirection.SHORT
+// Update trade active based on existing active short or long trades
+tradeActive := CPL.active or CPS.active
+posDir := CPL.active ? PositionDirection.LONG : CPS.active? PositionDirection.SHORT : PositionDirection.NONE
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+isFlagSet(int flags, int flagBit) =>
+    // returns true if the bit is set
+    flags % (2 * flagBit) >= flagBit
+
+getBrokerName(TpBroker tpb) =>
+    switch tpb
+        TpBroker.Webull            => "Webull Webull-Bot"
+        TpBroker.Robinhood         => "Robinhood RH-Bot"
+        TpBroker.TradeStationCash  => "TradeStation CaSH TradeStation"
+        TpBroker.TradeStationPaper => "TradeStation Paper TradeStation-Bot"
+        TpBroker.TraderPostPaper   => "TraderPost Paper Simple Long"
+        TpBroker.BlastAll          => "BlastAll"
+
+dumpPosition(Position curPos) =>
+    curRes = 'dumpPosition(curPos) : Enabled=false'
+    if not na(curPos)
+        curRes := 'dumpPosition(curPos) : Enabled=' + str.tostring(curPos.active) + ', Entry=' + str.tostring(curPos.entry) + ', Quantity=' + str.tostring(curPos.quantity)
+        curRes += ', takeProfit=' + str.tostring(curPos.takeProfit) + ', stopLoss=' + str.tostring(curPos.stopLoss) + ', trailingstop=' + str.tostring(curPos.trailingStop)
+        curRes += ', x_sl_set='+ str.tostring(curPos.x_sl_set) + ', ts_set='+str.tostring(curPos.ts_set)+', x_tp_set='+str.tostring(curPos.x_tp_set)+' direction='+str.tostring(curPos.direction)
+    curRes
+
+getIntraPrice(string tf, string priceType, bool xdp, bool xtr) =>
+    // tf = timeframe.main_period
+    [x_open, x_high, x_low, x_close, x_hl2, x_hlc3, x_ohlc4] = request.security(
+        syminfo.tickerid,
+        tf,
+        [open, high, low, close, hl2, hlc3, ohlc4],
+        barmerge.gaps_off,
+        barmerge.lookahead_off
+        )
+    result_price = switch priceType
+        "Open"     => x_open
+        "High"     => x_high
+        "Low"      => x_low
+        "Close"    => x_close
+        "HL2"      => x_hl2
+        "HLC3"     => x_hlc3
+        "OHLC4"    => x_ohlc4
+        => x_close
+    pre_price = result_price
+    result_price := na(result_price) ? na : result_price > 100 ? math.round(result_price * syminfo.mintick / 10, 3) : result_price
+    if xdp and xtr
+        log.info('getIntraPrice(tf, priceType): tf:{0}, result_price:{1} priceType:{2}, pre-price:{3}', tf, result_price, priceType, pre_price)
+    result_price
+
+getIntraPrice(string priceType, bool xdp, bool xtr) =>
+    tf = timeframe.period
+    // tf := '1'
+    [x_open, x_high, x_low, x_close, x_hl2, x_hlc3, x_ohlc4] = request.security(
+    syminfo.tickerid,
+    tf,
+        [open, high, low, close, hl2, hlc3, ohlc4],
+        barmerge.gaps_off,
+        barmerge.lookahead_off
+        )
+    float result_price = switch priceType
+        "Open"     => x_open
+        "High"     => x_high
+        "Low"      => x_low
+        "Close"    => x_close
+        "HL2"      => x_hl2
+        "HLC3"     => x_hlc3
+        "OHLC4"    => x_ohlc4
+        => x_close
+    pre_price = result_price
+    result_price := na(result_price) ? na : result_price > 100 ? math.round(result_price * syminfo.mintick / 10, 3) : result_price
+    if xdp and xtr
+        log.info('getIntraPrice(priceType): tf:{0}, result_price:{1} priceType:{2}, pre-price:{3}', tf, result_price, priceType, pre_price)
+    result_price
+//tPrice = getIntraPrice(timeframe.main_period , "Close")
+tPrice = getIntraPrice("5" , "Close", x_debug_price, inTestingRange)
+
+// Get price based on type
+getPrice(priceType) =>
+    switch priceType
+        'Close' => priceAdjust ? getIntraPrice("Close", x_debug_price, inTestingRange) : close
+        'Open' => priceAdjust ? getIntraPrice("Open", x_debug_price, inTestingRange) : open
+        'High' => priceAdjust ? getIntraPrice("High", x_debug_price, inTestingRange) : high
+        'Low' => priceAdjust ? getIntraPrice("Low", x_debug_price, inTestingRange) : low
+        'Median' => priceAdjust ? getIntraPrice("HL2", x_debug_price, inTestingRange) : hl2
+        'Typical' => priceAdjust ? getIntraPrice("HLC3", x_debug_price, inTestingRange) : hlc3
+        'Weighted' => priceAdjust ? getIntraPrice("OHLC4", x_debug_price, inTestingRange) : ohlc4
+        => priceAdjust ? getIntraPrice("close", x_debug_price, inTestingRange) : close
+// current price needs to be instantiated here because the getPrice functions must exits first, and after this point the variable is reference in some functions to avoid issues with the data feeds
+ePrice = getPrice(mainTriggerPriceType)
+
+getProfit(float entryPrice, float exitProfitAmount, TS_TYPE pType, PositionDirection direction) =>
+    tempProfitPrice = manual_exitProfit_price
+    if entryPrice > 0 and exitProfitAmount > 0
+        switch pType
+            TS_TYPE.DOLLAR =>  tempProfitPrice := direction== PositionDirection.LONG ? entryPrice + exitProfitAmount : entryPrice - exitProfitAmount
+            TS_TYPE.PERCENT => tempProfitPrice := direction == PositionDirection.LONG ? entryPrice + (entryPrice * exitProfitAmount) : entryPrice - (entryPrice * exitProfitAmount)
+    if x_debug_price and inTestingRange
+        log.info('getProfit : Calculated ABS Profit at ' + str.tostring(math.round(tempProfitPrice, 2)) + ' using entry price ' + str.tostring(entryPrice) + ' and loss ' + str.tostring(exitProfitAmount)+ ' direction '+ str.tostring(direction) )
+    math.round(tempProfitPrice, 2)
+
+getStop(float entryPrice, float exitLossAmount, PositionDirection direction) =>
+    float tempLossPrice = entryPrice
+    if entryPrice > 0 and exitLossAmount > 0
+        tempLossPrice := direction == PositionDirection.LONG ? (entryPrice - exitLossAmount) : (entryPrice + exitLossAmount)
+    if x_debug_price and inTestingRange
+        log.info('getStop :Calculated ABS Stop at ' + str.tostring(math.round(tempLossPrice, 2)) + ' using entry price ' + str.tostring(entryPrice) + ' and loss ' + str.tostring(exitLossAmount)+' direction '+str.tostring(direction))
+    math.round(tempLossPrice, 2)
+
+calculateRangeStopLoss(float basePrice, PositionDirection direction) =>
+    rangeStopLoss = 0.0
+    x_basePrice = basePrice
+    if direction == PositionDirection.LONG   
+        rangeStopLoss := switch true
+            x_basePrice < 0.5 => initStop * 0.5
+            1 > x_basePrice and x_basePrice < 0.5 => initStop * 0.75
+            2 <= x_basePrice and x_basePrice <  3 => initStop * 1.15
+            3 <= x_basePrice and x_basePrice <  4 => initStop * 1.25
+            4 >= x_basePrice and x_basePrice <  5 => initStop * 1.5
+            5 >= x_basePrice and x_basePrice <  7 => initStop * 1.75
+            7 >= x_basePrice and x_basePrice <  10 => initStop * 2
+            10 >= x_basePrice and x_basePrice <  15 => initStop * 2.25
+            15 >= x_basePrice and x_basePrice <  20 => initStop * 2.5
+            20 >= x_basePrice => initStop*3
+    if direction == PositionDirection.SHORT   
+        rangeStopLoss := switch true
+            x_basePrice < 0.5 => initStop * 0.5
+            1 > x_basePrice and x_basePrice > 0.5 => initStop * 0.75 // if  less than $1, reduce to .75
+            2 <= x_basePrice and x_basePrice <  3 => initStop * 1.1
+            3 <= x_basePrice and x_basePrice <  4 => initStop * 1.15
+            4 >= x_basePrice and x_basePrice <  5 => initStop * 1.2
+            5 >= x_basePrice and x_basePrice <  7 => initStop * 1.25
+            7 >= x_basePrice and x_basePrice <  10 => initStop * 1.5
+            10 >= x_basePrice and x_basePrice <  15 => initStop * 2
+            15 >= x_basePrice and x_basePrice <  20 => initStop * 2.5
+            20 >= x_basePrice => initStop * 3
+    if x_debug_price and inTestingRange
+        log.info('Setting Range Stop at ' + str.tostring(math.round(rangeStopLoss, 2)) + ' using entry price ' + str.tostring(x_basePrice) + ' and init ' + str.tostring(initStop))
+    rangeStopLoss
+
+getTS(float tsCurrent, float tsEntryPrice, PositionDirection direction) =>
+    // Orignal entry price used when type=% and static value so that the amount follows the price upward 
+    // when rangeBased the amount increases/decreases based on new levels changing the gap between the current price and the exit
+    tsResult = 0.00
+    tsPriceBase = tsEntryPrice 
+    tsLower = 0.0
+    hitActive = false
+    if direction == PositionDirection.LONG and (ts_amount > 0 or exitConfSL.rangeBased_SL_enabled or exitConfSL.trailingStop_exit_enabled) and CPL.active and (close > close[1] or not CPL.x_tp_set)
+        // trailing stop enabled and either the price has moved up or it is the first time calling
+        switch ts_type
+            '$' => tsLower := (exitConfSL.rangeBased_SL_enabled ? calculateRangeStopLoss(ePrice, direction) : ts_amount)
+            '%' => tsLower := (exitConfSL.rangeBased_SL_enabled ? (ePrice * calculateRangeStopLoss(ePrice, direction)) : (tsPriceBase * ts_amount))
+        tsResult := ePrice - tsLower
+        tsResult := CPL.active and tsResult > CPL.trailingStop ? math.round(tsResult, 2) : tsCurrent
+    if direction == PositionDirection.SHORT and (ts_amount > 0 or exitConfSL.rangeBased_SL_enabled or exitConfSL.trailingStop_exit_enabled) and CPS.active and (close < close[1] or not CPS.x_tp_set)
+        // trailing stop enabled and either the price has moved up or it is the first time calling
+        switch ts_type
+            '$' => tsLower := (exitConfSL.rangeBased_SL_enabled ? calculateRangeStopLoss(ePrice, direction) : ts_amount)
+            '%' => tsLower := (exitConfSL.rangeBased_SL_enabled ? (ePrice * calculateRangeStopLoss(ePrice, direction)) : (tsPriceBase * ts_amount))
+        tsResult := ePrice + tsLower
+        tsResult := CPS.active and tsResult < CPS.trailingStop ? math.round(tsResult, 2) : tsCurrent
+    if ((tsResult > tsCurrent and direction == PositionDirection.LONG) or (tsResult < tsCurrent and direction == PositionDirection.SHORT)) and x_debug_price and inTestingRange
+        log.info('getTS : Calculated new stop loss ' + str.tostring(tsResult) + ' Old ' + str.tostring(tsCurrent) + ' Price ' + str.tostring(ePrice))
+    tsResult
+    
+getTSInitial(float tsEntryPrice, Position CP, PositionDirection direction) =>
+    // Calculates the current trailing stop for the passed entry Price using the ExitConfig ts amount
+    // Returns the vaule if it is greater than the one set in the Position UDT if long, or if short calulates a lower stop 
+    // if it is less than the one in the Position UDT
+
+    tsResult = tsEntryPrice - exit_inputs.SLI.ts_amount
+    tsOld = CP.trailingStop > 0 ? CP.trailingStop : 0.0
+    if direction == PositionDirection.SHORT
+        tsResult := tsEntryPrice + exit_inputs.SSI.trailing_stop
+    if ts_type == '%'
+        tsResult := tsEntryPrice - (exit_inputs.SLI.ts_amount * tsEntryPrice) 
+        if direction == PositionDirection.SHORT
+            tsResult := tsEntryPrice + (exit_inputs.SSI.ts_amount * tsEntryPrice) 
+    tsResult := close > close[1] and tsResult > tsOld and direction == PositionDirection.LONG ? tsResult : tsOld
+    tsResult := close < close[1] and tsResult < tsOld and direction == PositionDirection.SHORT ? tsResult : tsOld
+
+    if x_debug_price and inTestingRange
+        log.info('getTSInitial : Calculated new stop loss {0} for entryPrice {1} and ePrice {2} direction {3}', tsResult, tsEntryPrice,ePrice, str.tostring(direction))
+    tsResult
+
+setMinProfit(float mpEntry, TS_TYPE pType, float pAmt, PositionDirection direction) =>
+    float tsResult = 0.0
+    switch pType    
+        TS_TYPE.DOLLAR => tsResult := direction == PositionDirection.LONG ? mpEntry + pAmt : mpEntry - pAmt
+        TS_TYPE.PERCENT => tsResult := direction == PositionDirection.LONG ? mpEntry + (mpEntry * pAmt) : mpEntry - (mpEntry * pAmt)
+    switch direction
+        PositionDirection.LONG => CPL.minProfit := tsResult
+        PositionDirection.SHORT => CPS.minProfit := tsResult
+
+calculateRangeTakeProfit(float rsPrice, float RTP, PositionDirection direction) =>
+    // calcluate risk to reward level
+    // the higher the stock price the more the profit multiplier, (i.e. stoploss=.08, stock=$2, profit = .20)
+    // (stocke=$6, stopLoss =.095 ($5.905), profit =0.38 ($6.38) )
+    // roughly 10%
+    float RSP = rsPrice > 0 ? rsPrice : getPrice(mainTriggerPriceType)
+    float rangeProfit = 0.0
+    if direction == PositionDirection.LONG
+        rangeProfit := ((RSP) + (RTP * 6)) // greater than $17 , so set profit to 6x base range loss
+        rangeProfit := RSP <= 3 ? ((RSP) + (RTP * 2.5)) : rangeProfit // low cost stock, so 2.5x of stoploss
+        rangeProfit := RSP > 3 and RSP < 5 ? ((RSP) + (RTP * 4)) : rangeProfit// low to meduim cost, so 4x profit
+        rangeProfit := RSP >= 5 and RSP < 17 ? ((RSP) + (RTP * 5)) : rangeProfit// medium cost stock, so set to 5x
+    else
+        rangeProfit := ((RSP) - (RTP * 12)) // greater than $17 , so set profit to 6x base range loss - .08x12 = .96
+        rangeProfit := RSP >= 2 and RSP < 3 ? RSP - (RTP * 2.5) : rangeProfit// under $2 use amount in input, if between 2 and 3 , incease by 2.5x (i.e. .20)
+        rangeProfit := RSP <= 3 ? ((RSP) - (RTP * 3)) : rangeProfit // low cost stock, so 3x (i.e. .24)
+        rangeProfit := RSP > 3 and RSP < 5 ? ((RSP) - (RTP * 4.5)) : rangeProfit// low to meduim cost, so 4.5x profit (i.e. .32.36)
+        rangeProfit := RSP >= 5 and RSP < 17 ? ((RSP) - (RTP * 6)) : rangeProfit// medium cost stock, so set to 6x (i.e .48)
+    if x_debug_price and inTestingRange
+        log.info('calculateRangeTakeProfit : rangeProfit={0} RSP:{1}, RTP {2}, rsPrice {3}, direction {4}',rangeProfit, RSP, RTP, rsPrice, str.tostring(direction))
+    rangeProfit
+ 
+
+
+getInitProfit(PositionDirection direction, float rsPrice, string stopType, float TP, float RP) =>
+    tp_used = 'na'
+    take_profit_amount = 0.0
+    if isFlagSet(exitFlags, TP_MANUAL)
+        take_profit_amount := tpManualPrice
+        tp_used := 'FP'
+    else
+        if isFlagSet(exitFlags, TP_RANGE)
+            take_profit_amount := RP
+            tp_used := 'RP'
+        else
+            if isFlagSet(exitFlags,TP_TRAIL)
+                take_profit_amount := TP
+                tp_used := 'TP'
+            else
+                take_profit_amount := direction == PositionDirection.LONG ? math.round(rsPrice * 1.3, 2) : math.round(rsPrice * 0.7, 2)
+                // CP.minProfit := CP.takeProfit
+                tp_used := 'manual'
+    switch direction
+        PositionDirection.LONG  => CPL.takeProfit := take_profit_amount, CPL.x_tp_set := tp_used != 'na' ? true : CPL.x_tp_set, CPL.minProfit := tp_used == 'manual' ? take_profit_amount : CPL.minProfit
+        PositionDirection.SHORT => CPS.takeProfit := take_profit_amount, CPS.x_tp_set := tp_used != 'na' ? true : CPS.x_tp_set, CPS.minProfit := tp_used == 'manual' ? take_profit_amount : CPS.minProfit
+    tp_used
+
+getInitTSL(PositionDirection direction, float TSL, float RSL) =>
+    ts_used = 'na'
+    trail_amount = 0.0
+    if isFlagSet(exitFlags,TSL_MANUAL)
+        trail_amount := tsManualPrice
+        ts_used := 'manual'
+    else // Rnage base trumps regular trailing stops, short and long share the enable flag (i.e. range is a global setting)
+        if isFlagSet(exitFlags,TSL_RANGE)
+            trail_amount := RSL
+            ts_used := 'RSL'
+        else
+            if isFlagSet(exitFlags,TSL_TRAIL)
+                trail_amount := TSL
+                ts_used := 'TSL'
+    switch direction
+        PositionDirection.LONG  => CPL.trailingStop := trail_amount, CPL.ts_set := ts_used != 'na' ? true : CPL.ts_set
+        PositionDirection.SHORT => CPS.trailingStop := trail_amount, CPS.ts_set := ts_used != 'na' ? true : CPS.ts_set
+    ts_used
+
+getInitSL(PositionDirection direction, float TSL, float RSL) =>
+    st_used = 'na'
+    trail_amount = 0.0
+    if isFlagSet(exitFlags,SL_MANUAL)
+        trail_amount := slManualPrice
+        st_used := 'manual'
+    else
+        if isFlagSet(exitFlags,SL_RANGE)
+            trail_amount := RSL
+            st_used := 'RSL'
+        else
+            if isFlagSet(exitFlags,SL_TRAIL)
+                trail_amount := TSL
+                st_used := 'TSL'
+            else
+                trail_amount := slManualPrice
+                st_used := 'absolute'
+    switch direction
+        PositionDirection.LONG  => CPL.stopLoss := trail_amount, CPL.x_sl_set := st_used != 'na' ? true : CPL.x_sl_set
+        PositionDirection.SHORT => CPS.stopLoss := trail_amount, CPS.x_sl_set := st_used != 'na' ? true : CPS.x_sl_set
+    st_used
+
+initStops(PositionDirection direction) =>
+    //rsPrice = getPrice(mainTriggerPriceType)
+    rsPrice = ePrice
+    RP = calculateRangeTakeProfit(rsPrice, tp_amount, direction)
+    TP = getProfit(rsPrice, tp_amount, intStopType, direction)  // convert stopType to int if needed
+    RSL = direction == PositionDirection.LONG ? rsPrice - calculateRangeStopLoss(rsPrice, direction) : rsPrice + calculateRangeStopLoss(rsPrice, direction)
+    TSL = direction == PositionDirection.LONG ? getTS(CPL.trailingStop, rsPrice, direction) : getTS(CPS.trailingStop, rsPrice, direction)
+
+    // compute takeProfit / trailingStop / stopLoss using exitFlags
+    takeProfit = 0.0
+    trailStop  = 0.0
+    stopLoss   = 0.0
+    tpUsed = 'na'
+    tsUsed = 'na'
+    slUsed = 'na'
+ 
+    // TP
+    if isFlagSet(exitFlags, TP_MANUAL)
+        takeProfit := tpManualPrice
+        tpUsed := 'FP'
+    else if isFlagSet(exitFlags, TP_RANGE)
+        takeProfit := RP
+        tpUsed := 'RP'
+    else if isFlagSet(exitFlags, TP_TRAIL)
+        takeProfit := TP
+        tpUsed := 'TP'
+    else
+        takeProfit := direction == PositionDirection.LONG ? math.round(rsPrice * 1.3,2) : math.round(rsPrice * 0.7,2)
+        tpUsed := 'manual'
+
+    // TSL
+    if isFlagSet(exitFlags, TSL_MANUAL)
+        trailStop := tsManualPrice
+        tsUsed := 'manual'
+    else if isFlagSet(exitFlags, TSL_RANGE)
+        trailStop := RSL
+        tsUsed := 'RSL'
+    else if isFlagSet(exitFlags, TSL_TRAIL)
+        trailStop := TSL
+        tsUsed := 'TSL'
+
+    // SL
+    if isFlagSet(exitFlags, SL_MANUAL)
+        stopLoss := slManualPrice
+        slUsed := 'manual'
+    else if isFlagSet(exitFlags, SL_RANGE)
+        stopLoss := RSL
+        slUsed := 'RSL'
+    else if isFlagSet(exitFlags, SL_TRAIL)
+        stopLoss := TSL
+        slUsed := 'TSL'
+    else
+        stopLoss := slManualPrice
+        slUsed := 'absolute'
+
+    // assign once to CPL / CPS
+    switch direction
+        PositionDirection.LONG =>
+            CPL.active := true
+            CPL.takeProfit := takeProfit
+            CPL.trailingStop := trailStop
+            CPL.stopLoss := stopLoss
+            CPL.x_tp_set := tpUsed != 'na' ? true : CPL.x_tp_set
+            CPL.ts_set := tsUsed != 'na' ? true : CPL.ts_set
+            CPL.x_sl_set := slUsed != 'na' ? true : CPL.x_sl_set
+        PositionDirection.SHORT =>
+            CPS.active := true
+            CPS.takeProfit := takeProfit
+            CPS.trailingStop := trailStop
+            CPS.stopLoss := stopLoss
+            CPS.x_tp_set := tpUsed != 'na' ? true : CPS.x_tp_set
+            CPS.ts_set := tsUsed != 'na' ? true : CPS.ts_set
+            CPS.x_sl_set := slUsed != 'na' ? true : CPS.x_sl_set
+    setMinProfit(rsPrice, intStopType, ts_min_profit, direction)
+    if direction == PositionDirection.LONG
+        array.push(CPLArray, CPL)
+    else
+        array.push(CPSArray, CPS)
+
+
+updateStops(float tsBasePrice, PositionDirection direction) =>
+// simple recalculate based on what is enabled, should only update trailing stops/profits if price goes up 
+    bool priceIncreased = close > close[1]
+    rsPrice = 0.0
+    RP = 0.0
+    TP = 0.0
+
+    if (priceIncreased)
+        // use CPL.entry (CP.entry) if set, or the passed price (tsBasePrice) if for some reason CP not set, or current price (ePrice) 
+        // if tsBasePrice is also not set
+        rsPrice := (direction == PositionDirection.LONG and not na(CPL.entry) and CPL.entry > 0.0 ? CPL.entry : not na(tsBasePrice) ? tsBasePrice : ePrice)
+        rsPrice := (direction == PositionDirection.SHORT and not na(CPS.entry) and CPS.entry > 0.0 ? CPS.entry : not na(tsBasePrice) ? tsBasePrice : ePrice)
+        RP := direction == PositionDirection.LONG and not na(CPL.takeProfit) and CPL.takeProfit > 0.0 ? CPL.takeProfit : calculateRangeTakeProfit(rsPrice, tp_amount, direction)
+        RP := direction == PositionDirection.SHORT and not na(CPS.takeProfit) and CPS.takeProfit > 0.0 ? CPS.takeProfit : calculateRangeTakeProfit(rsPrice, tp_amount, direction)
+        RPN = 0.0
+        TP := direction == PositionDirection.LONG ? CPL.takeProfit : direction == PositionDirection.SHORT ? CPS.takeProfit : TP
+        TPN = 0.0
+        FP = tpManualPrice
+        RSL = rsPrice - calculateRangeStopLoss(rsPrice, direction)
+        RSLN = 0.0
+        TSL = direction == PositionDirection.LONG and not na(CPL.trailingStop) and CPL.trailingStop > 0.0 ? CPL.trailingStop : getTS(CPL.trailingStop, rsPrice, direction)
+        TSL := direction == PositionDirection.SHORT and not na(CPS.trailingStop) and CPS.trailingStop > 0.0 ? CPS.trailingStop : getTS(CPS.trailingStop, rsPrice, direction)
+        TSLN = 0.0
+        STN = 0.0
+
+        nextTSL = direction == PositionDirection.LONG ? getTS(CPL.trailingStop, rsPrice, direction) : direction == PositionDirection.SHORT ? getTS(CPS.trailingStop, rsPrice, direction) : 0.0
+        // set the trailing stop/profit to a new one if it has changed, i.e. price increased
+        // Don't update if not enabled, leaving init set stops/profits
+        // LONG raises stops an profits, SHORT lowers stops and profits
+        string tp_used ='na'
+        string ts_used = 'na'
+        string st_used = 'na'
+        if direction == PositionDirection.LONG
+            CPL.trailingStop := nextTSL > TSL ? nextTSL : TSL
+        if direction == PositionDirection.SHORT
+            CPS.trailingStop := nextTSL < TSL ? nextTSL : TSL
+
+        if not isFlagSet(exitFlags,TP_MANUAL) and isFlagSet(exitFlags,TP_RANGE)
+        // if range based TP enabled for the either direction being updated
+            if (RP > CPL.takeProfit and direction == PositionDirection.LONG) or (RP < CPS.takeProfit and direction == PositionDirection.SHORT)
+                // LONG: higher recalculated, SHORT: lower recalculated
+                RPN := RP
+                tp_used := 'RP'   
+        
+        if not isFlagSet(exitFlags,SL_MANUAL) and isFlagSet(exitFlags,SL_RANGE)
+            if (RSL > CPL.trailingStop and direction == PositionDirection.LONG) or (RSL < CPS.trailingStop and direction == PositionDirection.SHORT)
+                RSLN := RSL
+                ts_used := 'RSL'
+                if (RSL > CPL.stopLoss and direction == PositionDirection.LONG) or (RSL < CPS.stopLoss and direction == PositionDirection.SHORT)
+                    STN := RSL
+                    st_used := 'RSL'
+            else
+                // Not range based stop losses, use trailing stop instead if enabled
+                if (TSL > CPL.trailingStop and direction == PositionDirection.LONG and isFlagSet(exitFlags,TSL_TRAIL)) or (TSL < CPS.trailingStop and direction == PositionDirection.SHORT and isFlagSet(exitFlags,TSL_TRAIL))
+                    TSLN := TSL   
+                    if (TSL > CPL.stopLoss and direction == PositionDirection.LONG) or (TSL < CPS.stopLoss and direction == PositionDirection.SHORT)
+                        // Set stopLoss to trailingStop  if TSL enabled
+                        STN := TSL
+                        st_used := 'TSL'
+
+        if direction == PositionDirection.LONG
+            CPL.takeProfit := RPN
+            CPL.trailingStop := RSLN
+            CPL.stopLoss := STN
+            CPL.x_tp_set := tp_used != 'na' ? true : CPL.x_tp_set
+            CPL.x_sl_set := st_used != 'na' ? true : CPL.x_sl_set
+            CPL.ts_set := ts_used != 'na' ? true : CPL.ts_set
+        if direction == PositionDirection.SHORT
+            CPS.takeProfit := RPN
+            CPS.trailingStop := RSLN
+            CPS.stopLoss := STN
+            CPS.x_tp_set := tp_used != 'na' ? true : CPS.x_tp_set
+            CPS.x_sl_set := st_used != 'na' ? true : CPS.x_sl_set
+            CPS.ts_set := ts_used != 'na' ? true : CPS.ts_set
+
+        if (x_debug_price and inTestingRange) // or (x_debug and inTestingRange)
+            log.info('updateStops:  RP:{0} FP:{1} RSL:{2} TSL:{3} tp_used:{4} ts_used:{5} st_used:{6} ePrice:{7} tsBasePrice:{8}', RP, FP, RSL, TSL, tp_used, ts_used, st_used, rsPrice, tsBasePrice)
+            //if x_debug_deep
+            //    dumpExitInputs(exit_inputs)
+            //    dumpTakeProfitInputs(takeProfit_inputs)
+            log.info('tp_amount : {0} ', tp_amount)
+        curSize = 0
+        // add back the currentPosition UDT to the tracking array
+        if direction == PositionDirection.LONG
+            curSize := CPL.active ? array.size(CPLArray) : 0
+            if curSize > 0
+                array.set(CPLArray, curSize - 1, CPL)
+        if direction == PositionDirection.SHORT
+            curSize := CPS.active ? array.size(CPSArray) : 0
+            if curSize > 0
+                array.set(CPSArray, curSize - 1, CPS)
+
+// Calculate TMA (Triangular Moving Average) with adaptive bands
+// Using standard non-repaint TMA = SMA(SMA(price, period), period)
+calculateTMABands(period, priceType, deviations) =>
+    float wu = 0.0
+    float wd = 0.0
+    price = getPrice(priceType)
+    //TMA calculation (non-repaint)
+    sma1 = ta.wma(price, period)
+    tma = ta.wma(sma1, period)
+    fullLength = 2.0 * period + 1.0
+    // Calculate deviation
+    diff = price - tma
+    // EMA-like calculation for variance (adaptive)
+    if bar_index <= period * 2
+        // Initialize
+        wu := diff * diff
+        wd := diff * diff
+        wd
+    else // Calculate variance based on direction
+        if diff >= 0
+            wu := (wu * (fullLength - 1) + diff * diff) / fullLength
+            wd := wd * (fullLength - 1) / fullLength
+            wd
+        else
+            wd := (wd * (fullLength - 1) + diff * diff) / fullLength
+            wu := wu * (fullLength - 1) / fullLength
+            wu
+    // Calculate bands
+    upperBand = tma + deviations * math.sqrt(wu)
+    lowerBand = tma - deviations * math.sqrt(wd)
+    [tma, upperBand, lowerBand]
+
+
+
+getBreakoutTrigger() =>
+    // Daily reset
+    isRTH    = session.ismarket
+    beforeTrigger = time < breakoutConf.triggerTime
+    // --- Establish day open ---
+    if na(breakoutConf.dayOpen)
+        if breakoutConf.usePreMarketHigh or isRTH
+            breakoutConf.dayOpen := open
+    // --- Build reference high ONLY until trigger time ---
+    bool buildRange = beforeTrigger and (breakoutConf.usePreMarketHigh or isRTH)
+    if buildRange
+        breakoutConf.dayHigh := na(breakoutConf.dayHigh) ? high : math.max(breakoutConf.dayHigh, high)
+        if x_debug_signals and x_debug_deep and inTestingRange
+            log.info('Setting daily high to {0}', breakoutConf.dayHigh)
+    // === CONDITIONS ===
+    float floatVolume = breakoutConf.floatSize * 1e6
+    bool validVolume = volume >= floatVolume * breakoutConf.volumeMultiplier
+
+    float currentPercentGain = ((close - breakoutConf.dayOpen) / breakoutConf.dayOpen) * 100
+    bool validSetup = validVolume and currentPercentGain >= breakoutConf.percentGain
+    bool breakout = isRTH and not beforeTrigger and close > breakoutConf.dayHigh
+    bool lockedOut = oneSignalPerDay and breakoutConf.breakoutFiredToday
+    bool longCondition = validSetup and breakout // and not lockedOut
+    if x_debug_signals and x_debug_deep and inTestingRange
+        log.info('ValidSetup {0}, breakout {1}, currentPercentGain {2}, dayHigh {3}, floatVolume {4}, validVolume {5}', validSetup, breakout, currentPercentGain, breakoutConf.dayHigh, floatVolume, validVolume)
+    if longCondition
+        breakoutConf.breakoutSignalActive := true
+        breakoutConf.breakoutFiredToday := true
+        CPL.signals.breakoutSignal := true
+    else
+        CPL.signals.breakoutSignal := false
+        breakoutConf.breakoutSignalActive := false
+        breakoutConf.breakoutFiredToday := false
+    longCondition
+getBullTMACrossEntry(LongEntryInputs bullEntryConf, tmaFast, tmaMain) =>
+    // Only called when tma_entry_enabled=true, implying one of the entry input options is TMA-Crossing, if primary then additional must be None (UC-1) or the logic must be 'or' (UC-2) 
+    // if the additional_entry_type is 'TMA-Crossing' (UC-3) then the logic must be 'or'
+    // the other use-case is if primary = 'Any' (UC-4) meaning the crossing is sufficient
+    signalResult = (ta.crossover(tmaFast, tmaMain) and (bullEntryConf.primary_entry_type == 'TMA-Crossing' and bullEntryConf.additional_entry_type == 'None') ? true : false)
+    signalResult := (ta.crossover(tmaFast, tmaMain) and (bullEntryConf.primary_entry_type == 'TMA-Crossing' and  bullEntryConf.additional_entry_type_logic == 'or') ? true : signalResult)
+    signalResult := (ta.crossover(tmaFast, tmaMain) and (bullEntryConf.additional_entry_type == 'TMA-Crossing' and  bullEntryConf.additional_entry_type_logic == 'or') ? true : signalResult)
+    signalResult := (ta.crossover(tmaFast, tmaMain) and (bullEntryConf.primary_entry_type == 'Any') ? true : signalResult)
+    CPL.signals.bullCross := signalResult and not tradeActive
+    signalResult and not tradeActive
+getBearTMACrossEntry(ShortEntryInputs bearEntryConf, LongEntryInputs bullEntryConf, tmaFast, tmaMain) =>
+    // Shorting only uses TMA cross with vwap required or not, so we only need to see if short is enabled and the crossing is triggered
+    signalResult = false
+
+    signalResult := ta.crossunder(tmaFast, tmaMain) and shortEnabled
+    // (bearEntryConf.entry_type == 'TMA-Crossing' and bullEntryConf.additional_entry_type == 'None')) ? true : signalResult
+
+    signalResult := (ta.crossunder(tmaFast, tmaMain) and
+        (bearEntryConf.entry_type == 'TMA-Crossing' and
+         bullEntryConf.additional_entry_type_logic == 'or')
+         ) ? true : signalResult
+
+    signalResult := (ta.crossunder(tmaFast, tmaMain) and
+        (bullEntryConf.additional_entry_type == 'TMA-Crossing' and
+         bullEntryConf.additional_entry_type_logic == 'or')) ? true : signalResult
+
+    signalResult := (ta.crossunder(tmaFast, tmaMain) and
+        (bearEntryConf.entry_type == 'Any')) ? true : signalResult
+    CPS.signals.bearCross := signalResult and not tradeActive
+    signalResult and not tradeActive
+
+getBullInRangeEntry(LongEntryInputs bullEntryConf, tmaFast, tmaMain) =>
+    // Called to see if tma_entry_required=true, implying it is enabled for entry, the check is just to see if fast > main and required entry is true
+    // Used to enforce tma crossing when the bool option to require tma-crossed up (i.e. bullish trend)
+    // if tma lowerFast crossed above lowerMain
+    tmaInRange = (tmaFast > tmaMain)
+    x_debug_signals and isNewLogBar ? log.info('getBullInRangeEntry : tmaInRange='+str.tostring(tmaInRange)+' tma_entry_required='+str.tostring(bullEntryConf.entryFlags.tma_entry_required)) : na
+    CPL.signals.tma_InBuyRange := tmaInRange and bullEntryConf.entryFlags.tma_entry_required and not tradeActive
+    tmaInRange and bullEntryConf.entryFlags.tma_entry_required and not tradeActive ? true : false
+
+getManualEntrySignal(PositionDirection direction, LongEntryInputs entryConfLong, ShortEntryInputs entryConfShort, float entryPrice) =>
+    // Calculate if manual entry price hit
+    entryPriceAbove = false
+    bool signal = false
+    bool manualEnabled = false
+    manualEnabled := (entryConfLong.entryFlags.manual_entry_enabled or entryConfLong.entryFlags.manual_entry_required or 
+        entryConfShort.entryFlags.manual_entry_enabled or entryConfShort.entryFlags.manual_entry_required)
+    entryCrossLong = (ta.crossover(entryPrice, entryConfLong.manual_entry_price) or (entryPrice > entryConfLong.manual_entry_price and
+        entryPrice < entryConfLong.manual_entry_price + 0.06) and (entryConfLong.entryFlags.manual_entry_enabled or 
+        entryConfLong.entryFlags.manual_entry_required ) )
+    entryCrossShort = (ta.crossunder(entryPrice, entryConfShort.manual_entry_price) or (entryPrice < entryConfShort.manual_entry_price and 
+        entryPrice > entryConfShort.manual_entry_price - 0.06) and (entryConfShort.entryFlags.manual_entry_enabled or 
+        entryConfShort.entryFlags.manual_entry_required))
+    signal := direction == PositionDirection.LONG ? entryCrossLong : direction == PositionDirection.SHORT ? entryCrossShort : signal
+    manualEntrySignal = signal and not CPL.signals.tradeActive and not tradeActive ? signal or manual_price_only: false
+    CPL.signals.manualEntrySignal := manualEntrySignal
+    manualEntrySignal
+
+
+getBullEnabled(LongEntryInputs bullEntryConf, float curPrice, vwapConfigInfo vwapInfo, tmaConfigInfo tmaInfo) =>
+    manualBullSignal = getManualEntrySignal(PositionDirection.LONG, entryInputs_long, entryInputs_short, curPrice)
+    manualEntrySignal = bullEntryConf.entryFlags.manual_entry_enabled ? manualBullSignal : bullEntryConf.entryFlags.manual_entry_required
+    CPL.signals.manualEntrySignal := manualEntrySignal
+    bull_vwap_InBuyRange = (bullEntryConf.entryFlags.vwap_entry_required ? curPrice > vwapInfo.vwap_upper : not bullEntryConf.entryFlags.vwap_entry_required)
+    CPL.signals.vwap_InBuyRange := bull_vwap_InBuyRange
+    bull_tma_EnterInRange = getBullInRangeEntry(entryInputs_long, tmaInfo.tma_lowerFast, tmaInfo.tma_lowerMain)
+    CPL.signals.tma_InBuyRange := bull_tma_EnterInRange
+    // capture bull signal - crossing (tma crossing up), if manual entry is not required and vwap in buy range
+    bullCross = getBullTMACrossEntry(bullEntryConf,tmaInfo.tma_lowerFast,tmaInfo.tma_lowerMain)
+    CPL.signals.bullCross := bullCross
+    entryCross = ta.crossover(curPrice, bullEntryConf.manual_entry_price)
+    CPL.signals.entryCross := entryCross
+    bullSignal = (manualEntrySignal and manual_price_only) // manual required and hits
+    bullSignal := (vwap_InBuyRange and bullCross and not bullEntryConf.entryFlags.manual_entry_required and not manual_price_only and not tradeActive ? true : bullSignal)  // manual entry disabled and tma/vwap hits
+    bullSignal := ((vwap_InBuyRange and bullCross and bullEntryConf.entryFlags.manual_entry_required and manualEntrySignal and not tradeActive )  ? true : bullSignal) // manual required and tma/vwap hits
+    BT = getBreakoutTrigger()
+    if x_debug_signals and isNewDay
+        log.info('breakout state {0} startWindow {1}, endWindow {2}', BT, dailyEntryStartTime, dailyExitStartTime)
+
+    bullSignal := (bullEntryConf.entryFlags.breakout_entry_enabled and CPL.signals.breakoutSignal ) or bullSignal
+    CPL.signals.bullSignal := bullSignal
+    
+
+    if x_debug_signals and isNewLogBar and inTestingRange
+        log.info('entryCross='+str.tostring(entryCross)+ ' close='+str.tostring(curPrice)+' manual_entry_price='+str.tostring(entryInputs_long.manual_entry_price))
+        log.info('Manual Entry check - tradeActive='+str.tostring(tradeActive)+ ' manualEntrySignal='+str.tostring(manualEntrySignal))
+        log.info('bullsignal = ' + str.tostring(bullSignal))
+    bullSignal
+
+getEodExitState() =>
+    //isLastRthBar = not na(time(timeframe.period, "0930-1600")) and na(time(timeframe.period, "0930-1600")[-1])
+    isLastRthBar = na(time(timeframe.period, "0930-1600")) and not na(time(timeframe.period, "0930-1600")[1])
+
+    dailyExitEndTime = dailyExitStartTime + 15 * 60 * 1000
+    //dailyExitInRange = (isLastRthBar or (time_close >= dailyExitStartTime) and (time < dailyExitEndTime)) and closeDaily
+    inRthOrExitWindow = not na(time(timeframe.period, "0930-1615"))
+
+    // dailyExitInRange = not eodExitFiredToday and (isLastRthBar or (time >= dailyExitStartTime and time < dailyExitEndTime)) and inRthOrExitWindow and closeDaily
+    dailyExitInRange = not eodExitFiredToday and (isLastRthBar or (time >= dailyExitStartTime and time < dailyExitEndTime)) and inRthOrExitWindow and closeDaily
+
+    if dailyExitInRange
+        CPL.signals.eodExitSignal := true
+        CPS.signals.eodExitSignal := true
+    dailyExitInRange
+
+getEodExitStateLastBar() =>
+    isLastRthBar = not na(time(timeframe.period, "0930-1600")) and na(time(timeframe.period, "0930-1600")[1])
+
+    if isLastRthBar and closeDaily
+        CPL.signals.eodExitSignal := true
+        CPS.signals.eodExitSignal := true
+    // log.info('isLastRthBar : {0}, closeDaily : {1}', isLastRthBar, closeDaily)
+    isLastRthBar and closeDaily
+
+getTMAExitSignal(
+    ExitInputs exitConf,
+    float tma,
+    float upperBand,
+    float lowerBand,
+    PositionDirection direction
+    ) =>
+    bool exitSignal = false
+    // --- Common conditions ---
+    bool priceAboveTMA = close > tma
+    bool priceBelowTMA = close < tma
+    bool tmaSlopeUp    = tma > tma[1]
+    bool tmaSlopeDown  = tma < tma[1]
+    bool tmaCrossedUnder = ta.crossunder(close, tma)
+    // --- LONG exits ---
+    if direction == PositionDirection.LONG
+        // 1️⃣ Cross back below TMA
+        if exitConf.SSI.exit_type == "TMA-Crossing"
+            exitSignal := tmaCrossedUnder
+        // 2️⃣ Upper band rejection (exhaustion)
+        if exitConf.SSI.exit_type == "TMA-Band"
+            exitSignal := high >= upperBand
+
+        // 3️⃣ Trend failure
+        if exitConf.SSI.exit_type == "TMA-Slope"
+            exitSignal := tmaSlopeDown and priceBelowTMA
+
+        // 4️⃣ Hybrid
+        if exitConf.SSI.exit_type == "Hybrid"
+            exitSignal := tmaCrossedUnder  or high >= upperBand
+        CPL.signals.tmaExitLong := exitSignal and tradeActive
+
+    // --- SHORT exits ---
+    if direction == PositionDirection.SHORT
+        // 1️⃣ Cross back above TMA
+        if exitConf.SSI.exit_type == "TMA-Cross"
+            exitSignal := tmaCrossedUnder
+        // 2️⃣ Lower band exhaustion
+        if exitConf.SSI.exit_type == "TMA-Band"
+            exitSignal := low <= lowerBand
+        // 3️⃣ Trend failure
+        if exitConf.SSI.exit_type == "TMA-Slope"
+            exitSignal := tmaSlopeUp and priceAboveTMA
+        // 4️⃣ Hybrid
+        if exitConf.SSI.exit_type == "Hybrid"
+            exitSignal :=tmaCrossedUnder or low <= lowerBand
+        CPL.signals.tmaExitShort := exitSignal and tradeActive
+    if x_debug_signals and isNewLogBar
+        log.info('TMA Exit | Dir={0} Type={1} Close={2} TMA={3} UB={4} LB={5} Exit={6}', str.tostring(direction), exitConf.SSI.exit_type, close, tma, upperBand, lowerBand, exitSignal)
+    exitSignal and tradeActive
+
+
+getTMACrossExit(ExitConfig bearExit, ExitInputs bearExitInputs, tmaFast, tmaMain, bool requireExclusiveTP, bool requireExclusiveSL) =>
+    // When tma_exit_enabled=true, implying one of the exit input options contains TMA-Crossing, if primary then additional must be None (UC-1) or the logic must be 'or' (UC-2/UC-3)
+    //    or one of the types equals Any with an 'or' logic (UC-4) 
+    bearExitAllowed = bearExit.tma_exit_required and bearExit.tma_exit_enabled
+    // UC-1 - StopLoss flagged with primary or additional exit with TMA and the logic is 'or'
+    bearExitAllowed := ((bearExitInputs.SLI.primary_stopLoss_type == 'TMA-Crossing' or bearExitInputs.SLI.additional_stopLoss_type == 'TMA-Crossing') and bearExitInputs.SLI.additional_stopLoss_type_logic == 'or' ? true : bearExitAllowed)
+    // UC-1-b - TMA crossed and is part of a combo selection 
+    bearExitAllowed := ((bearExitInputs.SLI.primary_stopLoss_type == 'TMA-Crossing' or bearExitInputs.SLI.additional_stopLoss_type == 'TMA-Crossing') and not requireExclusiveSL ? true : bearExitAllowed)
+    // UC-2 - TakeProfit flagged with primary exit is TMA and the logic is 'or'    
+    bearExitAllowed := ((bearExitInputs.TPI.additional_takeProfit_type == 'TMA-Crossing' or bearExitInputs.TPI.additional_takeProfit_type == 'TMA-Crossing') and  bearExitInputs.TPI.additional_takeProfit_type_logic == 'or' ? true : bearExitAllowed)
+    bearExitAllowed := ((bearExitInputs.TPI.additional_takeProfit_type == 'TMA-Crossing' or bearExitInputs.TPI.additional_takeProfit_type == 'TMA-Crossing') and  not requireExclusiveTP ? true : bearExitAllowed)
+    // UC-3 - StopLoss or TakeProfit flagged and additional is type none  
+    bearExitAllowed := ((bearExitInputs.SLI.additional_stopLoss_type == 'None' or bearExitInputs.SLI.primary_stopLoss_type == 'TMA-Crossing') ? true : bearExitAllowed)
+    bearExitAllowed := ((bearExitInputs.TPI.additional_takeProfit_type == 'None' or bearExitInputs.TPI.primary_takeProfit_type == 'TMA-Crossing') ? true : bearExitAllowed)
+    // UC-4 Type=Any, logic='or'
+    bearExitAllowed := ((bearExitInputs.SLI.additional_stopLoss_type == 'Any' or bearExitInputs.SLI.primary_stopLoss_type == 'Any') and bearExitInputs.SLI.additional_stopLoss_type_logic == 'or' ? true : bearExitAllowed)
+    bearExitAllowed := ((bearExitInputs.TPI.additional_takeProfit_type == 'Any' or bearExitInputs.TPI.primary_takeProfit_type == 'Any') and bearExitInputs.TPI.additional_takeProfit_type_logic == 'or' ? true : bearExitAllowed)
+    // finally, check if the crossing is true
+    //signalResult :=  (ta.crossunder(tmaFast, tmaMain) and bearExitAllowed ? true : signalResult)
+    tmaCrossedDown = ta.crossunder(tmaFast, tmaMain)
+    if x_debug_signals and isNewLogBar and inTestingRange
+        log.info('getTMACrossExit : bearExitAllowed='+str.tostring(bearExitAllowed)+' tmaCrossedDown='+str.tostring(tmaCrossedDown))
+    CPL.signals.tma_CrossedExit := tmaCrossedDown and bearExitAllowed and tradeActive
+    tmaCrossedDown and bearExitAllowed and tradeActive ? true : false
+
+
+
+getTMAInRangeExit(ExitConfig bearExit, lowerFast, tmaMain) =>
+    // Called to see if tma_exit_enabled=true, implying it is required as part of the exit criteria, the check is just to see if fast < main and tma is required as a condition to exit
+    // Used to enforce tma crossing when the bool option to require tma-crossed up (i.e. bullish trend)
+    // if tma lowerFast crossed above lowerMain and tma exit required
+    signalResult = bearExit.tma_exit_required ? lowerFast < tmaMain : not bearExit.tma_exit_required
+    CPL.signals.tma_InSellRange := signalResult and tradeActive
+    signalResult and tradeActive
+
+getPriceCrossExit(float exitPrice, bool exitEnableFlag) =>
+    // simply take the passed price and the flag for if the exit option is enabled, and see if the current price was crossed down
+    exitPriceBelow = ( ta.crossunder(ePrice, exitPrice) or (ePrice < exitPrice)) ? true : false
+    belowHit = exitPriceBelow and exitEnableFlag
+    // include other mandatory global conditions
+    otherFlags = tradeActive and inTestingRange
+    if x_debug_signals and isNewLogBar and inTestingRange
+        log.info('getPriceCrossExit() : exitPriceBelow:{0}, belowHit:{1} : ePrice:{2}', exitPriceBelow, belowHit, ePrice )
+    belowHit and otherFlags ? true : false
+
+getPriceCrossAboveExit(float exitPrice, bool exitEnableFlag) =>
+    // simply take the passed price and the flag for if the exit option is enabled, and see if the current price was crossed down
+    exitPriceAbove = ( ta.crossover(ePrice, exitPrice) or (ePrice > exitPrice)) ? true : false
+    aboveHit = exitPriceAbove and exitEnableFlag
+    // include other mandatory global conditions
+    otherFlags = tradeActive and inTestingRange
+    if x_debug_signals and isNewLogBar and inTestingRange
+        log.info('getPriceCrossAboveExit() : exitPriceAbove:{0}, aboveHit:{1} : ePrice:{2}', exitPriceAbove, aboveHit, ePrice )
+    aboveHit and otherFlags ? true : false
+
+getBearEnabled(ExitConfig bearExit, ExitInputs bearExitInputs, tmaConfigInfo tmaExitInfo, vwapConfigInfo vwapExitInfo) =>
+    // Main function to compare exit conditions
+    signalHit = false
+    // eodSignalHit = getEodExitState() // if swing trade not allowed and inside closeout window period, exit is valid
+    bear_tma_InExitRange = getTMAInRangeExit(bearExit,tmaExitInfo.tma_upperFast, tmaExitInfo.tma_upperMain)
+    bear_tma_InEntryRange = entryConf.tma_entry_enabled ? tmaExitInfo.tma_lowerFast > tmaExitInfo.tma_lowerMain and tmaExitInfo.tma_upperFast < tmaExitInfo.tma_upperMain : not entryConf.tma_entry_enabled
+    // set to true if crossed below and required, otherwise keep existing state
+    bear_vwap_InSellRange = (exitConf.vwap_exit_required  ? ePrice < vwapExitInfo.vwap_lower : not exitConf.vwap_exit_required)
+    // if required, set to true or false if above vwap else set as true (not required)
+    bear_vwap_InBuyRange = (entryConf.vwap_entry_required ? ePrice > vwapExitInfo.vwap_upper : not entryConf.vwap_entry_required)
+
+    exitManualHitSL = getPriceCrossExit(CPL.stopLoss, bearExitInputs.SLI.stopLossFlags.manual_exitStop_enabled)
+    exitManualHitTP = getPriceCrossAboveExit(CPL.takeProfit, bearExitInputs.TPI.takeProfitFlags.manual_exitProfit_enabled)
+    exitManualHit = exitManualHitSL or exitManualHitTP
+    // manual hit doesn't allow min profit, other take profit trails enforce if enabled
+    // see if Take Profit minimum has crossed or is disabled
+    exitTPMHit = getPriceCrossAboveExit(CPL.minProfit, bearExitInputs.TPI.takeProfitFlags.manual_exitProfit_enabled) or not bearExitInputs.TPI.ts_min_profit_enabled
+    // check for valid TMA only required hit
+    exitTMAHit = getTMACrossExit(bearExit, bearExitInputs, tmaExitInfo.tma_upperFast, tmaExitInfo.tma_upperMain, false, false)
+    // capture when no other stops are enabled
+    noStopsRequired = not bearExitInputs.SLI.stopLossFlags.manual_exitStop_enabled and not bearExitInputs.SLI.stopLossFlags.rangeBased_SL_enabled and not bearExitInputs.SLI.stopLossFlags.trailingStop_exit_enabled
+    noStopsRequired := noStopsRequired and not bearExitInputs.TPI.takeProfitFlags.manual_exitProfit_enabled and not bearExitInputs.TPI.takeProfitFlags.rangeBased_TP_enabled and not bearExitInputs.TPI.takeProfitFlags.trailingProfit_enabled
+    noStopsRequired := noStopsRequired and bearExitInputs.TPI.takeProfitFlags.tma_exit_required
+    exitTMAHit := exitTMAHit and noStopsRequired
+    // Non-Exclusive hits (crossing valid, but requires additional indicator hits)
+    crossTMAHitTP  = getTMACrossExit(bearExit, bearExitInputs, tmaExitInfo.tma_upperFast, tmaExitInfo.tma_upperMain, true, false)
+    crossTMAHitTP := crossTMAHitTP and exitTPMHit
+    crossTMAHitSL  = getTMACrossExit(bearExit, bearExitInputs, tmaExitInfo.tma_upperFast, tmaExitInfo.tma_upperMain, false, true)
+    // Trailing Profit check
+    exitTPHit = getPriceCrossAboveExit(CPL.takeProfit, bearExitInputs.TPI.takeProfitFlags.trailingProfit_enabled)
+    exitTPHit := exitTPHit and exitTPMHit
+    // Stop Loss check
+    exitSLHit = getPriceCrossExit(CPL.stopLoss, bearExitInputs.SLI.stopLossFlags.rangeBased_SL_enabled or bearExitInputs.SLI.stopLossFlags.trailingStop_exit_enabled)
+    // Trailing Stop check
+    exitTLSHit = getPriceCrossExit(CPL.stopLoss, bearExitInputs.SLI.stopLossFlags.trailingStop_exit_enabled or bearExitInputs.SLI.stopLossFlags.rangeBased_SL_enabled)
+    // check for short exit
+    exitShortSignal = false
+    exitLongSignal = false
+    switch posDir
+        PositionDirection.SHORT =>
+            CPS.signals.takeProfitSignal := CPS.active and (close < CPS.takeProfit) and (close < CPS.minProfit)
+            CPS.signals.stopSignal := (close > CPS.stopLoss) and CPS.active
+            exitShortSignal := CPS.signals.takeProfitSignal or CPS.signals.stopSignal
+        PositionDirection.LONG =>
+            CPL.signals.takeProfitSignal := CPL.active and (close > CPL.takeProfit) and (close > CPL.minProfit)
+            CPL.signals.stopSignal := (close < CPL.stopLoss) and CPL.active
+            exitLongSignal := CPL.signals.takeProfitSignal or CPL.signals.stopSignal
+   // any signal hit check
+    exitStopHit = exitTPHit or exitSLHit or exitTLSHit or exitTMAHit or exitManualHit or exitShortSignal or exitLongSignal
+    // Exclusive indicator hits combined with tma/vwap conditional (defaulted to true is not required)
+    signalHit := (exitStopHit and bear_vwap_InSellRange and bear_tma_InExitRange) ? true : signalHit // any indicator hit and vwap/tma per requirements
+    
+
+    if tradeActive and inTestingRange and CPL.active
+        CPL.signals.tma_InSellRange := bear_tma_InExitRange
+        CPL.signals.vwap_InSellRange := bear_vwap_InSellRange
+        CPL.signals.vwap_InBuyRange := bear_vwap_InBuyRange
+        CPL.signals.tma_CrossedExit := exitTMAHit
+        CPL.signals.takeProfitSignal := exitTPHit or CPL.signals.takeProfitSignal
+        CPL.signals.trailingStopLossSignal := exitTLSHit
+        CPL.signals.rangeStopLossSignal := exitSLHit
+        CPL.signals.bearSignal := signalHit
+
+    if tradeActive and inTestingRange and CPS.active
+        CPS.signals.tma_InSellRange := bear_tma_InExitRange
+        CPS.signals.vwap_InSellRange := bear_vwap_InSellRange
+        CPS.signals.vwap_InBuyRange := bear_vwap_InBuyRange
+        CPS.signals.tma_CrossedExit := exitTMAHit
+        CPS.signals.takeProfitSignal := exitTPHit or CPS.signals.takeProfitSignal 
+        CPS.signals.trailingStopLossSignal := exitTLSHit
+        CPS.signals.rangeStopLossSignal := exitSLHit
+        CPS.signals.bearSignal := signalHit
+    signalHit and tradeActive
+
+getBearInRangeEntry(ShortEntryInputs bearEntryConf, tmaFast, tmaMain) =>
+    tmaInRange = (tmaFast < tmaMain)
+    if x_debug_signals and isNewLogBar 
+        log.info(
+            'getBearInRangeEntry : tmaInRange={0} tma_entry_required={1}',
+            tmaInRange, bearEntryConf.entryFlags.tma_entry_required
+        )
+    CPS.signals.tma_InSellRange := tmaInRange and bearEntryConf.entryFlags.tma_entry_required and not tradeActive
+    tmaInRange and bearEntryConf.entryFlags.tma_entry_required and not tradeActive
+
+getBearEntryEnabled(ShortEntryInputs bearEntryConf, LongEntryInputs bullEntryConf, float curPrice,vwapConfigInfo vwapInfo,tmaConfigInfo tmaInfo, PositionDirection direction) =>
+    manualBearSignal = getManualEntrySignal(direction, bullEntryConf, bearEntryConf, curPrice)
+    manualEntrySignal = bearEntryConf.entryFlags.manual_entry_enabled ? manualBearSignal : bearEntryConf.entryFlags.manual_entry_required
+    CPS.signals.manualEntrySignal := manualEntrySignal
+
+    bear_vwap_InSellRange = bearEntryConf.entryFlags.vwap_entry_required ? curPrice < vwapInfo.vwap_lower : true
+    CPS.signals.vwap_InSellRange := bear_vwap_InSellRange
+    bear_tma_EnterInRange = getBearInRangeEntry(bearEntryConf, tmaInfo.tma_upperFast, tmaInfo.tma_upperMain)
+    CPS.signals.tma_InSellRange := bear_tma_EnterInRange
+    bearCross = getBearTMACrossEntry(bearEntryConf, bullEntryConf, tmaInfo.tma_upperFast, tmaInfo.tma_upperMain)
+    CPS.signals.bearCross := bearCross
+    // Capture manual only entry when short enabled and long disabled
+    bearSignal = (manualEntrySignal and manual_price_only) and not longEnabled and shortEnabled
+
+
+    bearSignal := (bear_vwap_InSellRange and bearCross and
+        not bearEntryConf.entryFlags.manual_entry_required and
+        not manual_price_only and
+        not tradeActive) ? true : bearSignal
+
+    bearSignal := (bear_vwap_InSellRange and bearCross and
+        bearEntryConf.entryFlags.manual_entry_required and
+        manualEntrySignal and
+        not tradeActive) ? true : bearSignal
+    CPS.signals.bearEntrySignal := bearSignal
+
+    bearSignal
+
+// ============================================================================
+// CALCULATE INDICATORS
+// ============================================================================
+
+// Calculate MAIN (SLOW) Bands
+[tmaMain, upperMain, lowerMain] = calculateTMABands(mainPeriod, mainPriceType, mainDeviations)
+// Calculate FAST Bands
+[tmaFast, upperFast, lowerFast] = calculateTMABands(fastPeriod, fastPriceType, fastDeviations)
+// TMA Main color based on slope
+tmaMainColor = tmaMain > tmaMain[1] ? color.lime : tmaMain < tmaMain[1] ? color.red : color.gray
+// Calculate TMA
+tmaConfigInfo tmaInfo = maketmaConfigInfo(tmaMain, upperMain, upperFast, lowerMain, lowerFast, mainPeriod, fastDeviations, mainDeviations, fastPeriod, mainPriceType, fastPriceType)
+// Calculate VWAP
+vwapConfigInfo vwapInfo = makevwapConfigInfo(vwap_stdDev, vwap_multiplier, ePrice) 
+
+vwap_main = ta.vwap(hlc3)
+vwap_deviation = ta.stdev(ePrice - vwap_main, vwap_stdDev)
+vwap_upper = vwap_main + vwap_multiplier * vwap_deviation
+vwap_lower = vwap_main - vwap_multiplier * vwap_deviation
+
+
+// ============================================================================
+// SIGNAL DETECTION
+// =================================================================
+
+if x_debug_price and isNewLogBar and inTestingRange
+    //log.info("New {1}-minute debug display interval started at: {0}", str.format_time(time, "HH:mm:ss"), debug_interval)
+    log.info('ePrice : {0} tradeActive : {1}', str.tostring(ePrice, format.mintick), tradeActive)
+// Calculate vwap above/below state
+// set to true crossed up and required, otherwise set to falsYYYY-MM-dd HH:e
+vwap_InBuyRange := (ePrice > vwap_lower and entryConf.vwap_entry_required ? true : false)
+// set to true if not required otherwise keep the current state
+vwap_InBuyRange := (not entryConf.vwap_entry_required ? true : vwap_InBuyRange)
+// set to false if vwap required, or set initial state to true
+vwap_InSellRange := (exitConf.vwap_exit_required ? false : true)
+// set to true if crossed below and required, otherwise keep existing state
+vwap_InSellRange := (ePrice < vwap_lower and exitConf.vwap_exit_required ? true : vwap_InSellRange)
+
+if tradeActive and inTestingRange and CPL.active
+    CPL.signals.vwap_InSellRange := vwap_InSellRange
+else
+    if inTestingRange and not CPL.active
+        CPL.signals.vwap_InBuyRange := vwap_InBuyRange
+
+tma_EnterInRange := getBullInRangeEntry(entryInputs_long, lowerFast, lowerMain)
+//bearEntryEnabled checks for short entry opportunity and manual force entry
+mustExit = getEodExitState()
+
+bearEntryEnabled = getBearEntryEnabled(entryInputs_short, entryInputs_long, ePrice, vwapInfo, tmaInfo, PositionDirection.SHORT) and posDir == PositionDirection.NONE
+shortEntrySignal = bearEntryEnabled and shortEnabled
+bullSignal = getBullEnabled(entryInputs_long, ePrice, vwapInfo, tmaInfo) and longEnabled
+ 
+
+if x_debug_signals and inTestingRange
+    log.info('INLINE-1 BULLSIGNAL : {0}', bullSignal)
+
+// ------------ LOCAL TRACKING VARIABLES ----------------------------
+// Calculate if tma exit signals hit
+tma_ExitInRange = getTMAInRangeExit(exitConf, upperFast, upperMain) or not exitConf.tma_exit_required
+tmaCrossed = (getTMACrossExit(exitConf, exit_inputs, upperFast, upperMain, true, true))
+
+exitPriceBelow = false
+// exitCross = ta.crossunder(ePrice, exit_inputs.SLI.manual_exitStop_price)
+exitPriceBelow := ( ePrice < exit_inputs.SLI.manual_exitStop_price and (ePrice < ( exit_inputs.SLI.manual_exitStop_price + 0.06)) and tradeActive)
+manualOnlyHit = exitPriceBelow and manual_price_only
+// Check for any stop loss or take profit valid state
+
+// Update the stops and check for bearSIgnal
+//updateStops(Position CP, ExitInputs EXI, exitConfigSL EXSL, exitConfigTP EXTP, float tsBasePrice, string stopTyp, PositionDirection direction)=>
+preLTS = not na(CPL) and tradeActive and posDir == PositionDirection.LONG ? CPL.trailingStop : na
+preSTS = not na(CPS) and tradeActive and posDir == PositionDirection.SHORT ? CPS.trailingStop : na
+switch posDir
+    PositionDirection.LONG  =>  
+        updateStops(ePrice, PositionDirection.LONG)
+        trailing_stop := CPL.trailingStop
+        if x_debug_bear or x_debug_deep
+            log.info('trailing_stop updated : New=' + str.tostring(CPL.trailingStop)+' Old='+str.tostring(preLTS))
+    PositionDirection.SHORT =>
+        updateStops(ePrice, PositionDirection.SHORT)
+        trailing_stop := CPS.trailingStop
+        if x_debug_bear or x_debug_deep
+            log.info('trailing_stop updated : New=' + str.tostring(CPS.trailingStop)+' Old='+str.tostring(preSTS))
+    PositionDirection.NONE =>
+        if x_debug_bear or x_debug_deep
+            log.info('update stops skipped, no active trade direction : posDir {0}', str.tostring(posDir))
+bearEnabled = false
+bearEnabled := getBearEnabled(exitConf, exit_inputs, tmaInfo, vwapInfo) and posDir == PositionDirection.LONG
+shortExitEnabled = getTMAExitSignal(exit_inputs, tmaMain, lowerFast, lowerMain, PositionDirection.SHORT) and CPS.active and shortEnabled
+bearSignal = (bearEnabled or shortExitEnabled) and tradeActive and inTestingRange and inDailyRange
+
+if x_debug_bear or x_debug_signals
+    log.info('bearSignal = ' + str.tostring(bearSignal) + ' bearEnabled = ' + str.tostring(bearEnabled) + ' profitMin = ' + str.tostring(ts_inputs.trailing_stop_min_profit))
+
+// Create default null values and calculate state for plot and plotshape if trades are active, done after updating the CPL UDT and checking for bearSignal
+// setup valid hits of individual indicators
+exitManualHit = false // CPL.signals.manualExitSignal and bearSignal
+exitTrailingProfitHit = false // CPL.signals.takeProfitSignal and bearSignal
+exitMinProfitHit = false // CPL.signals.takeProfitMinSignal and bearSignal
+exitTrailingStopHit = false // CPL.signals.trailingStopLossSignal and bearSignal
+exitStopHit = false // CPL.signals.stopSignal and bearSignal
+exitRangeHit = false // CPL.signals.rangeStopLossSignal and bearSignal
+trailingStopCrossed = false // CPL.signals.trailingStopLossSignal and bearSignal
+manualExitProfitSignal = false
+manualExitStopSignal = false
+trailingStopLossSignal = false
+rangeStopLossSignal =  false//(CPL.signals.stopSignal or CPL.signals.trailingStopLossSignal) and (exitConfTP.rangeBased_TP_enabled and bearSignal)
+tpRangeCrossed = false // CPL.signals.takeProfitSignal and exitConfTP.rangeBased_TP_enabled and bearSignal
+takeProfitMinSignal = false // CPL.signals.takeProfitMinSignal and bearSignal
+tpManualCrossed = false // CPL.signals.manualExitProfitSignal and bearSignal
+takeProfitSignal = false //  CPL.signals.takeProfitSignal and bearSignal
+stopLossSignal = false //  CPL.signals.stopSignal and bearSignal
+float takeProfitMinSignalPrice = na
+float exitProfitPrice = na
+float exitTrailingStopPrice = na
+float exitStopPrice = na
+float manualEntrySignalPrice = na
+float exitTailingStopPrice = na
+float trailingExitSignalPrice = na
+pipSize = syminfo.mintick * (syminfo.type == 'forex' ? 10 : 1)
+
+// Calculate stop,crossing,etc signal
+switch posDir
+    PositionDirection.LONG =>
+        manualExitStopSignal := CPL.signals.manualExitSignal
+        manualExitProfitSignal := CPL.signals.manualExitProfitSignal and bearSignal
+        trailingStopLossSignal := exitConfSL.trailingStop_exit_enabled and CPL.signals.trailingStopLossSignal and bearSignal
+        rangeStopLossSignal :=  (CPL.signals.stopSignal or CPL.signals.trailingStopLossSignal) and (exitConfTP.rangeBased_TP_enabled and bearSignal)
+        tpRangeCrossed := CPL.signals.takeProfitSignal and exitConfTP.rangeBased_TP_enabled and bearSignal
+        takeProfitMinSignal := CPL.signals.takeProfitMinSignal and bearSignal
+        takeProfitMinSignalPrice := CPL.minProfit
+        tpManualCrossed := CPL.signals.manualExitProfitSignal and bearSignal
+        takeProfitSignal := CPL.signals.takeProfitSignal and bearSignal
+        stopLossSignal :=  CPL.signals.stopSignal and bearSignal
+        exitManualHit := CPL.signals.manualExitSignal and bearSignal
+        exitTrailingProfitHit := CPL.signals.takeProfitSignal and bearSignal
+        exitProfitPrice := CPL.takeProfit
+        exitMinProfitHit := CPL.signals.takeProfitMinSignal and bearSignal
+        exitTrailingStopHit := CPL.signals.trailingStopLossSignal and bearSignal
+        exitTrailingStopPrice := exit_inputs.SLI.stopLossFlags.trailingStop_exit_enabled ? CPL.trailingStop : na
+        exitStopHit := CPL.signals.stopSignal and bearSignal
+        exitStopPrice := CPL.stopLoss
+        exitRangeHit := CPL.signals.rangeStopLossSignal and bearSignal
+        trailingStopCrossed := CPL.signals.trailingStopLossSignal and bearSignal
+        manualEntrySignalPrice := CPL.signals.manualEntrySignal?  lowerMain - signalOffset * pipSize : na
+        trailingExitSignalPrice := CPS.signals.trailingStopLossSignal ? lowerMain - signalOffset * pipSize : na 
+    PositionDirection.SHORT =>
+        manualExitStopSignal := CPS.signals.manualExitSignal
+        manualExitProfitSignal := CPS.signals.manualExitProfitSignal and shortExitEnabled
+        trailingStopLossSignal := CPS.signals.manualExitSignal and exitConfSL.manual_exitStop_enabled and shortExitEnabled
+        tpRangeCrossed := CPS.signals.takeProfitSignal and exitConfTP.rangeBased_TP_enabled and shortExitEnabled
+        rangeStopLossSignal :=  (CPS.signals.stopSignal or CPS.signals.trailingStopLossSignal) and (exitConfTP.rangeBased_TP_enabled and bearSignal)
+        takeProfitMinSignal := CPS.signals.takeProfitMinSignal and shortExitEnabled
+        takeProfitMinSignalPrice := CPS.minProfit
+        tpManualCrossed := CPS.signals.manualExitProfitSignal and shortExitEnabled
+        takeProfitSignal := CPS.signals.takeProfitSignal and shortExitEnabled
+        stopLossSignal :=  CPS.signals.stopSignal and shortExitEnabled
+        exitManualHit := CPS.signals.manualExitSignal and shortExitEnabled
+        exitTrailingProfitHit := CPS.signals.takeProfitSignal and shortExitEnabled
+        exitProfitPrice := CPS.takeProfit
+        exitMinProfitHit := CPS.signals.takeProfitMinSignal and shortExitEnabled
+        exitTrailingStopHit := CPS.signals.trailingStopLossSignal and shortExitEnabled
+        exitTrailingStopPrice := exit_inputs.SSI.exitShortFlags.trailingStop_exit_enabled ? CPS.trailingStop : na
+        exitStopHit := CPS.signals.stopSignal and shortExitEnabled
+        exitStopPrice := CPS.stopLoss
+        exitRangeHit := CPS.signals.rangeStopLossSignal and shortExitEnabled
+        trailingStopCrossed := CPS.signals.trailingStopLossSignal and shortExitEnabled
+        manualEntrySignalPrice := CPS.signals.manualEntrySignal? lowerMain - signalOffset * pipSize : na
+        trailingExitSignalPrice := CPS.signals.trailingStopLossSignal ? upperMain - signalOffset * pipSize : na 
+
+// exitTMAHit = tmaCrossed // and shortExitEnabled
+manualExitSignal = (manualExitProfitSignal or manualExitStopSignal)
+// ts_inputs.trailing_stop_min_profit := takeProfitMinSignalPrice
+
+
+
+
+if x_debug_signals and inTestingRange and x_debug_deep
+    dumpStopLossInputs(stopLoss_inputs)
+    dumpTakeProfitInputs(takeProfit_inputs)
+    dumpTrailingStopInputs(ts_inputs)
+    dumpExitConfig(exitConf)
+
+// Calculate signal price marker positions with offsets for chart
+
+bullSignalPrice = bullSignal ? lowerMain - signalOffset * pipSize : na
+bearSignalPrice = bearEnabled ? upperMain + signalOffset * pipSize : na
+takeProfitSignalPrice = takeProfitSignal ? upperMain + signalOffset * pipSize : na //above
+rangeStopSignalPrice = rangeStopLossSignal ? lowerMain - signalOffset * pipSize : na //below
+manualExitProfitSignalPrice = manualExitProfitSignal ? upperMain + signalOffset * pipSize : na  //above
+manualExitStopSignalPrice = manualExitStopSignal ? lowerMain - signalOffset * pipSize : na // below
+
+const int   PLOT_TMA            = 1
+const int   PLOT_VWAP           = 2
+const int   PLOT_TRAILING_LONG  = 4
+const int   PLOT_TRAILING_SHORT = 8
+const int   PLOT_BREAKOUT       = 16
+
+
+int plotFlags = (isFlagSet(exitFlags, TMA_EXIT) or isFlagSet(entryFlags, ENTRY_TMABULL) or isFlagSet(entryFlags, ENTRY_TMACROSS) or isFlagSet(entryFlags, ENTRY_TMAREQ) ? PLOT_TMA : 0) + (entryConf.vwap_entry_required or exitConf.vwap_exit_required ? PLOT_VWAP : 0) +    ((tradeActive and posDir == PositionDirection.LONG and (exitConfSL.trailingStop_exit_enabled or exitConfSL.rangeBased_SL_enabled) and CPL.trailingStop > 0) ? PLOT_TRAILING_LONG : 0) + ((tradeActive and posDir == PositionDirection.SHORT and (exitConfSL.trailingStop_exit_enabled or exitConfSL.rangeBased_SL_enabled) and CPS.trailingStop > 0) ? PLOT_TRAILING_SHORT : 0) + ((entryConf.breakout_entry_enabled and breakoutConf.breakoutSignalActive) ? PLOT_BREAKOUT : 0)
+
+// ============================================================================
+// PLOTTING
+// ============================================================================
+// Plot MAIN (SLOW) Bands
+plot(isFlagSet(plotFlags, PLOT_TMA) ? tmaMain : na, 'TMA MAIN', color = tmaMainColor, linewidth = 2, style = plot.style_line)
+plot(isFlagSet(plotFlags, PLOT_TMA) ? upperMain : na, 'Upper MAIN', color = color.gray, linewidth = 2, style = plot.style_line)
+plot(isFlagSet(plotFlags, PLOT_TMA) ? lowerMain : na, 'Lower MAIN', color = color.gray, linewidth = 2, style = plot.style_line)
+// Plot FAST Bands
+plot(isFlagSet(plotFlags, PLOT_TMA) ? tmaFast : na, 'TMA FAST', color = color.new(color.gray, 30), linewidth = 1, style = plot.style_line)
+plot(isFlagSet(plotFlags, PLOT_TMA) ? upperFast : na, 'Upper FAST', color = color.new(color.blue, 0), linewidth = 1, style = plot.style_line)
+plot(isFlagSet(plotFlags, PLOT_TMA) ? lowerFast : na, 'Lower FAST', color = color.new(color.aqua, 0), linewidth = 1, style = plot.style_line)
+// Plot VWAP
+plot(isFlagSet(plotFlags, PLOT_VWAP) ? vwap_main : na, title = 'VWAP Main', color=color.rgb(70, 9, 182), linewidth=2, style=plot.style_line, linestyle=plot.linestyle_dashed)
+plot(isFlagSet(plotFlags, PLOT_VWAP) ? vwap_upper : na, title = 'VWAP Upper Band', color=color.rgb(94, 255, 82), linewidth=2, style=plot.style_line, linestyle=plot.linestyle_dashed)
+plot(isFlagSet(plotFlags, PLOT_VWAP) ? vwap_lower : na, title = 'VWAP Lower Band', color=color.rgb(255, 82, 82), linewidth=2, style=plot.style_line, linestyle=plot.linestyle_dashed)
+
+// Plot trailing stop
+//plot(tradeActive and exitConfSL.trailingStop_exit_enabled and (CPL.trailingStop > 0) ? CPL.trailingStop : na , "Trailing Stop", color=color.rgb(200, 255, 82, 40), linewidth=2, style=plot.style_linebr)
+plot((isFlagSet(plotFlags, PLOT_TRAILING_LONG) or isFlagSet(plotFlags, PLOT_TRAILING_SHORT) ) ? exitTrailingStopPrice : na, "Trailing Stop", color=color.rgb(200, 255, 82, 20), linewidth=2, style=plot.style_linebr)
+
+plot(entryConf.breakout_entry_enabled ? breakoutConf.dayHigh: na, "Day High", color=color.rgb(234, 106, 157))
+plotshape(breakoutConf.breakoutSignalActive and not bullSignal,title="Breakout",location=location.abovebar,color=color.green,style=shape.labelup,text="Breakout")
+bgcolor(entryConf.breakout_entry_enabled and breakoutConf.breakoutSignalActive ? color.new(color.green, 85) : na)
+
+// Plot Signals (Prisms = shape.diamond
+plotshape(bullSignalPrice, 'Bull Signal', shape.diamond, location.absolute, color = color.green, size = size.tiny)
+plotshape(bearSignalPrice, 'Bear Signal', shape.diamond, location.absolute, color = color.red, size = size.tiny)
+plotshape(manualEntrySignalPrice, 'Manual Entry Signal', shape.diamond, location.absolute, color = color.green, size = size.tiny)
+plotshape(manualExitProfitSignalPrice, 'Manual Profit Signal', shape.diamond, location.absolute, color = color.rgb(37, 12, 223), size = size.tiny)
+plotshape(takeProfitSignalPrice, 'Range Profit Signal', shape.triangleup, location.absolute, color = color.rgb(13, 248, 123), size = size.tiny)
+plotshape(rangeStopSignalPrice, 'Range Stop Signal', shape.triangledown, location.absolute, color = color.rgb(248, 13, 138), size = size.tiny)
+plotshape(manualExitStopSignalPrice, 'Manual Stop Signal', shape.diamond, location.absolute, color = color.red, size = size.tiny)
+plotshape(trailingExitSignalPrice, 'Trailing Stop Signal', shape.diamond, location.absolute, color = color.rgb(255, 82, 200), size = size.tiny)
+
+// ============================================================================
+// ALERTS & Strategy Entry/Exit
+// ============================================================================
+//
+canEnter = (not tradeActive) and (bullSignal or shortEntrySignal) and inTestingRange and (not dailyLimitReached) and inDailyRange
+if x_debug_signals and inTestingRange
+    log.info('INLINE-03 canEnter : {0}, bullSignal : {1}', canEnter, bullSignal)
+// Create the validation flag for exiting, default to false
+canExit = tradeActive
+mustExit := closeDaily and getEodExitState()
+
+// Check required indicators state and update based on condition
+// if position type variable has a current active trade enabled and any of the signals have been triggered, set canExit to true
+//canExit := (CPL.active and (bearSignal or stopLossSignal or takeProfitSignal) ? true : canExit)
+// if swing trading disabled and end of market day reached, set canExit to true
+
+
+canExit := bearSignal and inTestingRange
+
+// Update the trailing stop if the trade is active, done after logic checking for crossing down
+
+
+if tradeActive and not canExit and (x_debug_signals or x_debug_bear) and inTestingRange//  and isNewLogBar
+    log.info('Active Trade NoExitSignal : CPL : {0}', dumpPosition(CPL))
+
+rtBarStatus :=  barstate.isrealtime and barstate.isconfirmed
+rtBarStatus :=  barstate.isconfirmed
+if (x_debug_bull or x_debug_signals) and canEnter and inTestingRange// and rtBarStatus
+    log.info('Entry Variables : bullsignal=' + str.tostring(bullSignal)+ ' vwap_InBuyRange='+str.tostring(vwap_InBuyRange) + ' tma_EnterInRange='+str.tostring(tma_EnterInRange) + ' manualEntrySignal='+str.tostring(CPL.signals.manualEntrySignal))
+    log.info('Entry Variables : entryConf.manual_entry_enabled='+str.tostring(entryConf.manual_entry_enabled) + ' canEnter='+str.tostring(canEnter))
+// add target subscription name for TP JSON if enabled - used for debugging only, doesn't work on Trader Post to select the subscription
+tp_sub = ""
+if x_tp_subscription
+    // add target subscription name for TP JSON if enabled - used for debugging only, doesn't work on Trader Post to select the subscription
+    tp_sub := '"extras": {\n "subscriptionName": "' + getBrokerName(x_tpBroker) + '"\n },\n'
+string alertMessage = ''
+string alertTitle = ''
+if x_debug_signals and inTestingRange
+    log.info('INLINE-04 bullSignal : {0} canEnter : {1}', bullSignal, canEnter)
+if x_debug_bear and inTestingRange
+    log.info('CPL : {0} ', dumpPosition(CPL))
+    log.info('CPS : {0}', dumpPosition(CPS))
+if canEnter and inTestingRange and inDailyRange
+    // Valid entry codition, continue to enter strategy if realtime bar is confirmed
+    if barstate.isrealtime and not barstate.isrealtime[1]
+        log.warning("🔴 canEnter ENTERED REALTIME MODE @ {0}", time)
+    ePrice := getPrice(mainTriggerPriceType)
+    
+    posDir := CPL.signals.bullSignal ? PositionDirection.LONG : CPS.signals.bearEntrySignal ? PositionDirection.SHORT : PositionDirection.NONE
+    float x_close = ePrice
+    x_close := math.round((ePrice + x_orderEnterGap), 2)
+    if enableAlerts       
+        if x_debug_bull
+            log.info('canEnter triggered - Entered if block')
+            logMessage = 'Flags : x_sl_set='+str.tostring(CPL.x_sl_set)+' x_tp_set='+str.tostring(CPL.x_tp_set)+' tp_set='+str.tostring(CPL.ts_set)
+            logMessage := logMessage + ' exitConfTP.manual_exitProfit_enabled: '+str.tostring(exitConfTP.manual_exitProfit_enabled)+' exitConfTP.rangeBased_TP_enabled : '
+            logMessage := logMessage + str.tostring(exitConfTP.rangeBased_TP_enabled)+' exitConfSL.manual_exitStop_enabled : '+str.tostring(exitConfSL.manual_exitStop_enabled)+' exitConfSL.rangeBased_SL_enabled : '
+            logMessage := logMessage + str.tostring(exitConfSL.rangeBased_SL_enabled)+' exitConfSL.trailingStop_exit_enabled : '+str.tostring(exitConfSL.trailingStop_exit_enabled)
+            logMessage := logMessage + ' takeProfit_inputs.takeProfitFlags.trailingProfit_enabled : '+str.tostring(takeProfit_inputs.takeProfitFlags.trailingProfit_enabled)
+            logMessage := logMessage + ' exit_inputs.TPI.takeProfitFlags.manual_exitProfit_enabled : '+str.tostring(exit_inputs.TPI.takeProfitFlags.manual_exitProfit_enabled) 
+            log.info('{0}',logMessage)
+            // takeProfit_inputs.takeProfitFlags.trailingProfit_enabled or exit_inputs.TPI.takeProfitFlags.manual_exitProfit_enabled
+        if x_debug_price
+            log.info('Price at trigger:{0} stored result :{1} ticker:{2} mintick:{3} pricescale:{4}, type:{5}, pointvalue:{6}, close: {7} tPrice:{8}',ePrice, CPL.entry, syminfo.tickerid, syminfo.mintick, syminfo.pricescale, syminfo.type, syminfo.pointvalue, close, tPrice)
+        //log.info('inTestingRange {0} rtBarStatus {1}', inTestingRange, rtBarStatus)
+        switch posDir
+            PositionDirection.LONG =>
+                if x_setTargets
+                    // include stop/profit targets in the traderpost json
+                    alertMessage := '{\n' + str.tostring(tp_sub) + '"ticker": "' + syminfo.ticker + '",\n"action": "buy",\n "quantityType": "dollar_amount",\n "quantity": ' + str.tostring(x_quantity)
+                    alertMessage := alertMessage + ',\n "no_add": true,\n "takeProfit":{\n "percent": ' + str.tostring(x_tp) + '\n },\n "stopLoss":{\n "type": "stop",\n "percent": '
+                    alertMessage := alertMessage + str.tostring(x_sl) + '},\n"orderType": "limit",\n"limitPrice": '+ str.tostring(x_close) + '\n}'
+                    if x_debug and inTestingRange
+                        log.info('{0} : \n : {1}', scriptName, alertMessage)
+                else
+                    // no stop/profit targets in the traderpost json
+                    alertMessage := '{\n' + str.tostring(tp_sub) + '"ticker": "' + syminfo.ticker + '",\n"action": "buy",\n "quantityType": "dollar_amount",\n "quantity": '
+                    alertMessage += str.tostring(x_quantity) + ',\n "no_add": true,\n "orderType": "limit",\n"limitPrice": '+ str.tostring(x_close) + '\n}'
+                    if x_debug and inTestingRange
+                        log.info('{0} : \n : {1}', scriptName, alertMessage)
+            PositionDirection.SHORT =>
+                if posDir == PositionDirection.SHORT
+                    alertMessage := "Ticker " + syminfo.ticker + ' short signal hit'
+                if enableAlertsEnter and rtBarStatus and posDir == PositionDirection.LONG
+                    alertTitle := str.tostring(syminfo.ticker) + 'BUY triggered.'
+                    alert(alertMessage, alert.freq_once_per_bar_close)
+    log.info('In canEnter shortEnabled {0}, longEnabled {1}, posDir {2}', shortEnabled, longEnabled, str.tostring(posDir))
+    // based on long or short, enter a trade
+    switch posDir
+        PositionDirection.SHORT =>
+            if shortEnabled
+                CPS.active := true
+                CPS.entry := ePrice
+                initStops(PositionDirection.SHORT)
+                CPS.direction := PositionDirection.SHORT
+                log.info('CPS after initStops: {0}', dumpPosition(CPS))
+                strategy.entry("Short", strategy.short)
+                tradeActive := true
+                dailyLimitReached := oneSignalPerDay
+        PositionDirection.LONG =>
+            if longEnabled
+                CPL.active := true
+                CPL.entry := ePrice
+                initStops(PositionDirection.LONG)
+                CPL.direction := PositionDirection.LONG
+                log.info('CPL after initStops : {0}', dumpPosition(CPL))
+                strategy.entry("Long", strategy.long)
+                tradeActive := true
+                dailyLimitReached := oneSignalPerDay
+        PositionDirection.NONE =>
+            log.warning('Can Enter attempted with posDir == NONE')
+    if x_debug_bull
+        if rtBarStatus
+            log.info('Resetting close rtBarStatus:{0}:x_close {1} fix_close:{2}', rtBarStatus, x_close, ePrice)
+        else
+            log.info('Resetting close rtBarStatus:{0} : ePrice : {1}', rtBarStatus, ePrice)
+    if (x_debug_bull) // and rtBarStatus
+        log.info('Post Entry state : direct : {0}', str.tostring(CPL.direction))
+        log.info(str.tostring(dumpPosition(CPL)))
+
+if x_debug_bear and inTestingRange
+    // debug to validate canExit and triggers
+    log.info('canExit set to ' + str.tostring(canExit) + ' mustExit : '+str.tostring(mustExit)+'Strategy Position Size : ' + str.tostring(strategy.position_size) + ' CPL : ' + str.tostring(dumpPosition(CPL)))
+    log.info('CPS : {0}', dumpPosition(CPS))
+    log.info('canExit VWAP State : ' + str.tostring(vwap_InSellRange) + ' TMA State :' + str.tostring(tma_ExitInRange))
+    log.info('EOD Signal {0}', mustExit)
+    log.info(' Close = ' + str.tostring(ePrice))
+
+// log.info('mustExit p2 {0}, inTestingRange {1}, canExit : {2}', mustExit, inTestingRange, canExit)
+if (canExit or mustExit) and inTestingRange and tradeActive
+    // Valid exit state, on realtime bar, perform strategy exit if realtime bar is confirmed
+    strategy.close_all()
+    log.info('Entered exit : mustExit : {0}', mustExit)
+    float x_close = math.round((ePrice - x_orderExitGap), 2)
+    if x_debug or x_debug_bear or mustExit
+        log.info('Entered canExit at {0}', ePrice)
+        log.info('canExit {0}, inTestingRange {1}, mustExit : {2}', canExit, inTestingRange, mustExit)
+        log.info('canExit set to ' + str.tostring(canExit) + ' mustExit : '+str.tostring(mustExit)+'Strategy Position Size : ' + str.tostring(strategy.position_size) + ' CPL : ' + str.tostring(dumpPosition(CPL)))
+        log.info('CPS : {0}', dumpPosition(CPS))
+        log.info('CPL : {0}', dumpPosition(CPL))
+        log.info('canExit VWAP State : ' + str.tostring(vwap_InSellRange) + ' TMA State :' + str.tostring(tma_ExitInRange))
+        log.info('EOD Signal {0}', mustExit)
+        log.info(' Close = ' + str.tostring(ePrice))
+    if barstate.isrealtime and not barstate.isrealtime[1]
+        log.warning("🔴 canExit ENTERED REALTIME MODE @ {0}", time)
+    if  (x_debug or x_debug_bear or x_debug_signals or mustExit) //and  x_debug_deep
+        switch posDir
+            PositionDirection.LONG => 
+                log.info('Exit Long reason : dailyEodSignal:{0} SLH:{1} SL-Amount:{2} TrailingStop:{3} TalkeProfit:{4}',
+                CPL.signals.eodExitSignal, stopLossSignal, CPL.stopLoss, CPL.trailingStop, CPL.takeProfit)
+            PositionDirection.SHORT =>
+                log.info('Exit Short reason : dailyEodSignal:{0} SLH:{1} SL-Amount:{2} TrailingStop:{3} TalkeProfit:{4}',
+                CPS.signals.eodExitSignal, stopLossSignal, CPS.stopLoss, CPS.trailingStop, CPS.takeProfit)
+            PositionDirection.NONE =>
+                log.info('Exit reason na, posDir set to NONE')
+    if CPL.signals.eodExitSignal or CPS.signals.eodExitSignal or mustExit
+        log.info('EOD closure triggered')
+    if enableAlerts
+        alertMessage := '{\n' + str.tostring(tp_sub) + '"ticker": "' + str.tostring(syminfo.ticker) + '",\n"action": "exit",\n"orderType": "limit",\n"limitPrice": '+ str.tostring(x_close) + '\n}'
+        alertTitle := str.tostring(syminfo.ticker) + 'SELL triggered'
+        if x_debug
+            log.info('{0} : \n : {1}', scriptName, alertMessage)
+    strategy.close_all()
+
+    if rtBarStatus and enableAlertsExit and not shortExitEnabled
+        alert(alertMessage, alert.freq_once_per_bar_close)
+    if x_debug_bear
+        log.info('Strategy Exit : x_close:'+str.tostring(x_close)+' ePrice:'+str.tostring(ePrice)+' ')
+    // exit everything every time when triggered and set to inactive
+    switch posDir
+        PositionDirection.LONG =>
+            curIndLong = array.size(CPLArray) - 1
+            if curIndLong >= 0 and posDir == PositionDirection.LONG
+                array.set(CPLArray, curIndLong, CPL)
+                for ind = 0 to curIndLong
+                    // walk the position array and make sure all historical UDT positions are set to inactive
+                    Position lPos = array.get(CPLArray, ind)
+                    lPos.active := false
+                    array.set(CPLArray, ind, lPos)
+        PositionDirection.SHORT =>
+            curIndShort = array.size(CPSArray) - 1
+            if curIndShort >= 0 and posDir == PositionDirection.SHORT
+                array.set(CPSArray, curIndShort, CPS)
+                for ind = 0 to curIndShort
+                    // walk the position array and make sure all historical UDT positions are set to inactive
+                    Position sPos = array.get(CPSArray, ind)
+                    sPos.active := false
+                    array.set(CPSArray, ind, sPos)
+        PositionDirection.NONE =>
+            log.warning('Entered exit while posDir set to NONE')
+    // set flags for gating per day usage
+    eodExitFiredToday := mustExit ? true : eodExitFiredToday
+    dailyLimitReached := oneSignalPerDay
+    posDir := PositionDirection.NONE
+    tradeActive := false
