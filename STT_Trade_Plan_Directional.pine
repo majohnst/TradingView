@@ -1,5 +1,5 @@
 //@version=6
-// MJ 28-Dec-2025
+// MJ 31-Dec-2025
 strategy('STT Trade Plan Directional', overlay=true, initial_capital=1000, default_qty_type=strategy.fixed, default_qty_value=200, process_orders_on_close=true, pyramiding=0)
 import TradingView/ta/11
 
@@ -58,15 +58,15 @@ mainTriggerPriceType = input.string('Close', 'Price Trigger Type', options = ['C
 bool oneSignalPerDay  = input.bool(true, "Limit Only One Trade Per Day", group = 'Trade Entry Triggers', confirm=true, display=display.data_window)
 bool closeDaily = input.bool(false, "Enable Daily Close", group = 'Trade Entry Triggers', tooltip='When enabled all trades will be exited at time selected.',confirm=true, display=display.data_window)
 tradeDirectionSelected = input.enum(TradeDirection.Long, title='Trade types allowed', group = 'Trade Entry Triggers', tooltip = 'Type of trades Long, Short or both that backtesting and alert will get triggered.')
-int dailyEntryWindowStartHour = input.int(8, title="Hour (ET) to begine allowing trade entry", minval = 4, maxval = 19)
-int dailyEntryWindowStartMinute = input.int(30, title="Minutes after Hour to begin allowing trade entry", minval = 0, step = 15, maxval = 45)
-int dailyExitWindowStartHour = input.int(15, title="Hour (ET) to force daily trade exits", minval = 11, maxval = 19)
-int dailyExitWindowStartMinute = input.int(45, title="Minutes after Hour to force trade exits", minval = 0, step = 15, maxval = 45)
-
+int dailyEntryWindowStartHour = input.int(8, title="Hour (ET) to begine allowing trade entry", minval = 4, maxval = 19, group = 'Trade Time Triggers')
+int dailyEntryWindowStartMinute = input.int(30, title="Minutes after Hour to begin allowing trade entry", minval = 0, step = 15, maxval = 45, group = 'Trade Time Triggers')
+int dailyExitWindowStartHour = input.int(15, title="Hour (ET) to force daily trade exits", minval = 11, maxval = 19, group = 'Trade Time Triggers')
+int dailyExitWindowStartMinute = input.int(45, title="Minutes after Hour to force trade exits", minval = 0, step = 15, maxval = 45, group = 'Trade Time Triggers')
+int exitBufferMinutes = input.int(15, title="Force Exit Buffer Minutes", minval = 15, maxval = 59, step=5, group = 'Trade Time Triggers')
+bool allowETH = input.bool(false, title="Allow Trading Alerts in Extended Hours", group = 'Trade Time Triggers')
+// SuperNova LowFloat Breakout Settings
 int triggerHour   = input.int(9, "Trigger Entry Enable Hour (ET)", group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
 int triggerMinute = input.int(45, "Trigger Entry Enable Minute", group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
-
-// SuperNova LowFloat Breakout Settings
 bool usePreMarketHigh = input.bool(false, "Include Pre-Market High", group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
 float floatSize         = input.float(3.0, "Max Float Size (M)", step=0.1, group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
 float volumeMultiplier = input.float(5.0, "Volume Multiplier", step=0.1, group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
@@ -449,8 +449,7 @@ dumpExitInputs(ExitInputs curEI) =>
     else
         log.info('dumpExitInputs: ExitInputs == na')
 
-pad2(x) =>
-    x < 10 ? "0" + str.tostring(x) : str.tostring(x)
+
 
 // --------------- UDT Invocations ---------------------------
 // Create the primary entry config trigger iablevaraible using defaults
@@ -523,7 +522,6 @@ bool ts_min_profit_enabled = ts_min_profit > 0 ? true : false
 
 
 
-
 // initialize each and then override (disabling other options) if manual_price only is ticked
 ExitConfig exitConf = makeExitConfig(tma_exit_enabled and not manual_price_only, (exitConfSL.tma_exit_required or exitConfTP.tma_exit_required or tma_exit_required) and not manual_price_only, vwap_exit_required and not manual_price_only)
 exitConf := manual_price_only ? makeExitConfig(false, false, false) : exitConf
@@ -540,17 +538,35 @@ takeProfit_inputs := manual_price_only ? TakeProfitInputs.new('Fixed-Price', 'an
 ShortStopInputs exit_inputs_short = makeShortStopInputs(tmaCrossingType, rangeBased,shortBasedInit,ts_amount, ts_min_profit, ts_amount, ts_min_profit_enabled, trailing_stop_min_profit, exitConfShort)
 ExitInputs exit_inputs = ExitInputs.new(stopLoss_inputs, takeProfit_inputs, exit_inputs_short)
 var breakoutConfig breakoutConf = makeBreakoutConfig(floatSize, volumeMultiplier, percentGain, triggerHour, triggerMinute, usePreMarketHigh)
+
 // dailyExitStartTime = timestamp(syminfo.timezone, year, month, dayofmonth, dailyExitWindowStartHour, dailyExitWindowStartMinute)
 // dailyEntryStartTime = timestamp(syminfo.timezone, year, month, dayofmonth, dailyEntryWindowStartHour, dailyEntryWindowStartMinute)
+// ======== Session Helper Functions ===========
+pad2(x) =>
+    x < 10 ? "0" + str.tostring(x) : str.tostring(x)
+
+f_timeToday(dayST, h , m) =>
+    dayST + (h * 60 + m) * 60 * 1000
 
 dayStart = time("D")
+bool isNewDay = ta.change(time("D")) != 0
+var bool eodExitFiredToday = false
 dailyExitStartTime = dayStart + (dailyExitWindowStartHour * 60 + dailyExitWindowStartMinute) * 60 * 1000
 dailyEntryStartTime = dayStart + (dailyEntryWindowStartHour * 60 + dailyEntryWindowStartMinute) * 60 * 1000
 //entrySessionStr = str.format("{0:02d}{1:02d}-{2:02d}{3:02d}", dailyEntryWindowStartHour, dailyEntryWindowStartMinute, dailyExitWindowStartHour, dailyExitWindowStartMinute)
 entrySessionStr = pad2(dailyEntryWindowStartHour) + pad2(dailyEntryWindowStartMinute) + "-" + pad2(dailyExitWindowStartHour)  + pad2(dailyExitWindowStartMinute)
+
+entryStart = f_timeToday(dayStart, dailyEntryWindowStartHour, dailyEntryWindowStartMinute)
+exitStart = f_timeToday(dayStart, dailyExitWindowStartHour, dailyExitWindowStartMinute)
+exitEnd = exitStart + exitBufferMinutes * 60 * 1000
 //bool inDailyRange = time >= dailyEntryStartTime and time_close <= dailyExitStartTime 
 inSession = not na(time(timeframe.period, entrySessionStr))
-bool inDailyRange = inSession // and time >= dailyEntryStartTime and time_close <= dailyExitStartTime
+inRTH = not na(time(timeframe.period, "0930-1600"))
+sessionOK = allowETH ? true : inRTH
+inEntryWindow = inRTH and time >= entryStart and time < exitStart
+inExitAlertWindow = inRTH and not eodExitFiredToday and time >= exitStart and time < exitEnd
+
+bool inDailyRange = inSession and time >= dailyEntryStartTime and time_close <= dailyExitStartTime
 // inTestingRange := inTestingRange and inDailyRange
 var dailyLimitReached = false
 shortEnabled = false
@@ -568,8 +584,7 @@ longEnabled := switch tradeDirectionSelected
     TradeDirection.Both    => true
     => false
 
-bool isNewDay = ta.change(time("D")) != 0
-var bool eodExitFiredToday = false
+
 // Daily reset
 if isNewDay
     breakoutConf := makeBreakoutConfig(floatSize, volumeMultiplier, percentGain, triggerHour, triggerMinute, usePreMarketHigh)
@@ -1377,12 +1392,21 @@ getEodExitState() =>
 
 getEodExitStateLastBar() =>
     isLastRthBar = not na(time(timeframe.period, "0930-1600")) and na(time(timeframe.period, "0930-1600")[1])
-
     if isLastRthBar and closeDaily
         CPL.signals.eodExitSignal := true
         CPS.signals.eodExitSignal := true
     // log.info('isLastRthBar : {0}, closeDaily : {1}', isLastRthBar, closeDaily)
     isLastRthBar and closeDaily
+
+getEodExit() =>
+    safetyClose = (ta.change(time("D")) != 0) and tradeActive and closeDaily
+    switch eodExitFiredToday
+        false =>
+            CPL.signals.eodExitSignal := true
+            CPS.signals.eodExitSignal := true
+            (closeDaily and inExitAlertWindow and tradeActive) or safetyClose
+        true => 
+            false
 
 getTMAExitSignal(
     ExitInputs exitConf,
@@ -1494,7 +1518,6 @@ getPriceCrossAboveExit(float exitPrice, bool exitEnableFlag) =>
 getBearEnabled(ExitConfig bearExit, ExitInputs bearExitInputs, tmaConfigInfo tmaExitInfo, vwapConfigInfo vwapExitInfo) =>
     // Main function to compare exit conditions
     signalHit = false
-    // eodSignalHit = getEodExitState() // if swing trade not allowed and inside closeout window period, exit is valid
     bear_tma_InExitRange = getTMAInRangeExit(bearExit,tmaExitInfo.tma_upperFast, tmaExitInfo.tma_upperMain)
     bear_tma_InEntryRange = entryConf.tma_entry_enabled ? tmaExitInfo.tma_lowerFast > tmaExitInfo.tma_lowerMain and tmaExitInfo.tma_upperFast < tmaExitInfo.tma_upperMain : not entryConf.tma_entry_enabled
     // set to true if crossed below and required, otherwise keep existing state
@@ -1649,7 +1672,6 @@ else
 
 tma_EnterInRange := getBullInRangeEntry(entryInputs_long, lowerFast, lowerMain)
 //bearEntryEnabled checks for short entry opportunity and manual force entry
-mustExit = getEodExitState()
 
 bearEntryEnabled = getBearEntryEnabled(entryInputs_short, entryInputs_long, ePrice, vwapInfo, tmaInfo, PositionDirection.SHORT) and posDir == PositionDirection.NONE
 shortEntrySignal = bearEntryEnabled and shortEnabled
@@ -1841,12 +1863,12 @@ plotshape(trailingExitSignalPrice, 'Trailing Stop Signal', shape.diamond, locati
 // ALERTS & Strategy Entry/Exit
 // ============================================================================
 //
-canEnter = (not tradeActive) and (bullSignal or shortEntrySignal) and inTestingRange and (not dailyLimitReached) and inDailyRange
+canEnter = (not tradeActive) and (bullSignal or shortEntrySignal) and inTestingRange and (not dailyLimitReached) and sessionOK
 if x_debug_signals and inTestingRange
     log.info('INLINE-03 canEnter : {0}, bullSignal : {1}', canEnter, bullSignal)
 // Create the validation flag for exiting, default to false
 canExit = tradeActive
-mustExit := closeDaily and getEodExitState()
+mustExit = getEodExit()
 
 // Check required indicators state and update based on condition
 // if position type variable has a current active trade enabled and any of the signals have been triggered, set canExit to true
@@ -1855,9 +1877,6 @@ mustExit := closeDaily and getEodExitState()
 
 
 canExit := bearSignal and inTestingRange
-
-// Update the trailing stop if the trade is active, done after logic checking for crossing down
-
 
 if tradeActive and not canExit and (x_debug_signals or x_debug_bear) and inTestingRange//  and isNewLogBar
     log.info('Active Trade NoExitSignal : CPL : {0}', dumpPosition(CPL))
@@ -1879,7 +1898,7 @@ if x_debug_signals and inTestingRange
 if x_debug_bear and inTestingRange
     log.info('CPL : {0} ', dumpPosition(CPL))
     log.info('CPS : {0}', dumpPosition(CPS))
-if canEnter and inTestingRange and inDailyRange
+if canEnter and inTestingRange and sessionOK
     // Valid entry codition, continue to enter strategy if realtime bar is confirmed
     if barstate.isrealtime and not barstate.isrealtime[1]
         log.warning("🔴 canEnter ENTERED REALTIME MODE @ {0}", time)
@@ -1923,7 +1942,8 @@ if canEnter and inTestingRange and inDailyRange
                 if enableAlertsEnter and rtBarStatus and posDir == PositionDirection.LONG
                     alertTitle := str.tostring(syminfo.ticker) + 'BUY triggered.'
                     alert(alertMessage, alert.freq_once_per_bar_close)
-    log.info('In canEnter shortEnabled {0}, longEnabled {1}, posDir {2}', shortEnabled, longEnabled, str.tostring(posDir))
+    if x_debug_deep
+        log.info('In canEnter shortEnabled {0}, longEnabled {1}, posDir {2}', shortEnabled, longEnabled, str.tostring(posDir))
     // based on long or short, enter a trade
     switch posDir
         PositionDirection.SHORT =>
@@ -1932,7 +1952,8 @@ if canEnter and inTestingRange and inDailyRange
                 CPS.entry := ePrice
                 initStops(PositionDirection.SHORT)
                 CPS.direction := PositionDirection.SHORT
-                log.info('CPS after initStops: {0}', dumpPosition(CPS))
+                if x_debug_deep
+                    log.info('CPS after initStops: {0}', dumpPosition(CPS))
                 strategy.entry("Short", strategy.short)
                 tradeActive := true
                 dailyLimitReached := oneSignalPerDay
@@ -1942,7 +1963,8 @@ if canEnter and inTestingRange and inDailyRange
                 CPL.entry := ePrice
                 initStops(PositionDirection.LONG)
                 CPL.direction := PositionDirection.LONG
-                log.info('CPL after initStops : {0}', dumpPosition(CPL))
+                if x_debug_deep
+                    log.info('CPL after initStops : {0}', dumpPosition(CPL))
                 strategy.entry("Long", strategy.long)
                 tradeActive := true
                 dailyLimitReached := oneSignalPerDay
@@ -1969,9 +1991,10 @@ if x_debug_bear and inTestingRange
 if (canExit or mustExit) and inTestingRange and tradeActive
     // Valid exit state, on realtime bar, perform strategy exit if realtime bar is confirmed
     strategy.close_all()
-    log.info('Entered exit : mustExit : {0}', mustExit)
+    if x_debug_deep
+        log.info('Entered exit : mustExit : {0}', mustExit)
     float x_close = math.round((ePrice - x_orderExitGap), 2)
-    if x_debug or x_debug_bear or mustExit
+    if x_debug_deep or x_debug_bear
         log.info('Entered canExit at {0}', ePrice)
         log.info('canExit {0}, inTestingRange {1}, mustExit : {2}', canExit, inTestingRange, mustExit)
         log.info('canExit set to ' + str.tostring(canExit) + ' mustExit : '+str.tostring(mustExit)+'Strategy Position Size : ' + str.tostring(strategy.position_size) + ' CPL : ' + str.tostring(dumpPosition(CPL)))
@@ -1982,7 +2005,7 @@ if (canExit or mustExit) and inTestingRange and tradeActive
         log.info(' Close = ' + str.tostring(ePrice))
     if barstate.isrealtime and not barstate.isrealtime[1]
         log.warning("🔴 canExit ENTERED REALTIME MODE @ {0}", time)
-    if  (x_debug or x_debug_bear or x_debug_signals or mustExit) //and  x_debug_deep
+    if  (x_debug_deep or x_debug_bear or x_debug_signals or mustExit) //and  x_debug_deep
         switch posDir
             PositionDirection.LONG => 
                 log.info('Exit Long reason : dailyEodSignal:{0} SLH:{1} SL-Amount:{2} TrailingStop:{3} TalkeProfit:{4}',
