@@ -1,5 +1,5 @@
 //@version=6
-// MJ 31-Dec-2025
+// MJ 28-Dec-2025
 strategy('STT Trade Plan Directional', overlay=true, initial_capital=1000, default_qty_type=strategy.fixed, default_qty_value=200, process_orders_on_close=true, pyramiding=0)
 import TradingView/ta/11
 
@@ -551,6 +551,14 @@ f_timeToday(dayST, h , m) =>
 dayStart = time("D")
 bool isNewDay = ta.change(time("D")) != 0
 var bool eodExitFiredToday = false
+var dailyLimitReached = false
+// Daily reset
+if isNewDay
+    breakoutConf := makeBreakoutConfig(floatSize, volumeMultiplier, percentGain, triggerHour, triggerMinute, usePreMarketHigh)
+    dailyLimitReached := false
+    eodExitFiredToday := false
+
+
 dailyExitStartTime = dayStart + (dailyExitWindowStartHour * 60 + dailyExitWindowStartMinute) * 60 * 1000
 dailyEntryStartTime = dayStart + (dailyEntryWindowStartHour * 60 + dailyEntryWindowStartMinute) * 60 * 1000
 //entrySessionStr = str.format("{0:02d}{1:02d}-{2:02d}{3:02d}", dailyEntryWindowStartHour, dailyEntryWindowStartMinute, dailyExitWindowStartHour, dailyExitWindowStartMinute)
@@ -563,12 +571,11 @@ exitEnd = exitStart + exitBufferMinutes * 60 * 1000
 inSession = not na(time(timeframe.period, entrySessionStr))
 inRTH = not na(time(timeframe.period, "0930-1600"))
 sessionOK = allowETH ? true : inRTH
-inEntryWindow = inRTH and time >= entryStart and time < exitStart
-inExitAlertWindow = inRTH and not eodExitFiredToday and time >= exitStart and time < exitEnd
+inEntryWindow = sessionOK and time >= entryStart and time < exitStart
+inExitAlertWindow = sessionOK and not eodExitFiredToday and time >= exitStart and time < exitEnd
 
-bool inDailyRange = inSession and time >= dailyEntryStartTime and time_close <= dailyExitStartTime
-// inTestingRange := inTestingRange and inDailyRange
-var dailyLimitReached = false
+// bool inDailyRange = inSession and time >= dailyEntryStartTime and time_close <= dailyExitStartTime
+
 shortEnabled = false
 longEnabled = true
 tpManualPrice  = exit_inputs.TPI.manual_exitProfit_price
@@ -585,11 +592,7 @@ longEnabled := switch tradeDirectionSelected
     => false
 
 
-// Daily reset
-if isNewDay
-    breakoutConf := makeBreakoutConfig(floatSize, volumeMultiplier, percentGain, triggerHour, triggerMinute, usePreMarketHigh)
-    dailyLimitReached := false
-    eodExitFiredToday := false
+
 // clear the daily single limit flag if it is not enabled via inputs, the enter section sets dailyLimitReached to true on every entry to make it enforced and prevent a race condition
 // if previous bar set the dailyLimitedReached flag and the oneSignalPerDay input is set to enable (true), keep the state until reset by isNewDay, otherwise 
 // set back to false - i.e. ture and true = true, true and false = false, false and false = false, false and true = false 
@@ -1713,7 +1716,7 @@ switch posDir
 bearEnabled = false
 bearEnabled := getBearEnabled(exitConf, exit_inputs, tmaInfo, vwapInfo) and posDir == PositionDirection.LONG
 shortExitEnabled = getTMAExitSignal(exit_inputs, tmaMain, lowerFast, lowerMain, PositionDirection.SHORT) and CPS.active and shortEnabled
-bearSignal = (bearEnabled or shortExitEnabled) and tradeActive and inTestingRange and inDailyRange
+bearSignal = (bearEnabled or shortExitEnabled) and tradeActive and inTestingRange and sessionOK
 
 if x_debug_bear or x_debug_signals
     log.info('bearSignal = ' + str.tostring(bearSignal) + ' bearEnabled = ' + str.tostring(bearEnabled) + ' profitMin = ' + str.tostring(ts_inputs.trailing_stop_min_profit))
