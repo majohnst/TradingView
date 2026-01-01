@@ -1,5 +1,5 @@
 //@version=6
-// MJ 28-Dec-2025
+// MJ 31-Dec-2025
 strategy('STT Trade Plan Directional', overlay=true, initial_capital=1000, default_qty_type=strategy.fixed, default_qty_value=200, process_orders_on_close=true, pyramiding=0)
 import TradingView/ta/11
 
