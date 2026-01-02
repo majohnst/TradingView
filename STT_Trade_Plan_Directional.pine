@@ -1,5 +1,5 @@
 //@version=6
-// MJ 31-Dec-2025
+// MJ 02-Jan-2026
 strategy('STT Trade Plan Directional', overlay=true, initial_capital=1000, default_qty_type=strategy.fixed, default_qty_value=200, process_orders_on_close=true, pyramiding=0)
 import TradingView/ta/11
 
@@ -1936,12 +1936,12 @@ if canEnter
                     alertMessage += str.tostring(tpQuantity) + ',\n "no_add": true,\n "orderType": "limit",\n"limitPrice": '+ str.tostring(gapClose) + '\n}'
                     if debug 
                         log.info('{0} : \n : {1}', scriptName, alertMessage)
+                if enableAlertsEnter and rtBarStatus
+                    alertTitle := str.tostring(syminfo.ticker) + 'BUY triggered.'
+                    alert(alertMessage, alert.freq_once_per_bar_close)
             PositionDirection.SHORT =>
                 if posDir == PositionDirection.SHORT
                     alertMessage := "Ticker " + syminfo.ticker + ' short signal hit'
-                if enableAlertsEnter and rtBarStatus and posDir == PositionDirection.LONG
-                    alertTitle := str.tostring(syminfo.ticker) + 'BUY triggered.'
-                    alert(alertMessage, alert.freq_once_per_bar_close)
     if debugDeep
         log.info('In canEnter shortEnabled {0}, longEnabled {1}, posDir {2}', shortEnabled, longEnabled, str.tostring(posDir))
     // based on long or short, enter a trade
