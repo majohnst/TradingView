@@ -1,5 +1,5 @@
 //@version=6
-// MJ 02-Jan-2026
+// MJ 08-Jan-2026
 strategy('STT Trade Plan Directional', overlay=true, initial_capital=1000, default_qty_type=strategy.fixed, default_qty_value=200, process_orders_on_close=true, pyramiding=0)
 import TradingView/ta/11
 
@@ -689,7 +689,7 @@ type signalSettings
     bool bullCross              = false
     bool bearCross              = false
     bool entryCross             = false
-    bool bearEnabled            = false
+    bool bearExitSignal         = false
     bool tradeActive            = false
     bool breakoutSignal         = false
     bool dailyLimitReached      = false
@@ -1449,7 +1449,7 @@ getTMAExitSignal(
             exitSignal := tmaSlopeUp and priceAboveTMA
         // 4️⃣ Hybrid
         if exitConf.SSI.exitType == "Hybrid"
-            exitSignal :=tmaCrossedUnder or low <= lowerBand
+            exitSignal := tmaCrossedUnder or low <= lowerBand
         CPL.signals.tmaExitShort := exitSignal and tradeActive
     if debugSignals and isNewLogBar
         log.info('TMA Exit | Dir={0} Type={1} Close={2} TMA={3} UB={4} LB={5} Exit={6}', str.tostring(direction), exitConf.SSI.exitType, close, tma, upperBand, lowerBand, exitSignal)
@@ -1511,9 +1511,23 @@ getPriceCrossAboveExit(float exitPrice, bool exitEnableFlag) =>
         log.info('getPriceCrossAboveExit() : exitPriceAbove:{0}, aboveHit:{1} : ePrice:{2}', exitPriceAbove, aboveHit, ePrice )
     aboveHit and otherFlags ? true : false
 
-getBearEnabled(ExitConfig bearExit, ExitInputs bearExitInputs, tmaConfigInfo tmaExitInfo, vwapConfigInfo vwapExitInfo) =>
+getBearExitSignal(ExitConfig bearExit, ExitInputs bearExitInputs, tmaConfigInfo tmaExitInfo, vwapConfigInfo vwapExitInfo) =>
     // Main function to compare exit conditions
-    signalHit = false
+    signalHit       = false
+    exitShortSignal = false
+    exitLongSignal  = false
+    exitSLHit       = false
+    exitTLSHit      = false
+    exitTPHit       = false
+    exitTPMHit      = false
+    exitManualHitSL = false
+    exitManualHitTP = false
+    exitSLHit  := getPriceCrossExit(CPL.stopLoss, bearExitInputs.SLI.stopLossFlags.rangeBasedSlEnabled or bearExitInputs.SLI.stopLossFlags.trailingStopExitEnabled)
+    exitTLSHit := getPriceCrossExit(CPL.stopLoss, bearExitInputs.SLI.stopLossFlags.trailingStopExitEnabled or bearExitInputs.SLI.stopLossFlags.rangeBasedSlEnabled)
+    exitTPHit  := getPriceCrossAboveExit(CPL.takeProfit, bearExitInputs.TPI.takeProfitFlags.trailingProfitEnabled)
+    exitTPMHit := getPriceCrossAboveExit(CPL.minProfit, bearExitInputs.TPI.takeProfitFlags.manualExitProfitEnabled) or not bearExitInputs.TPI.tsMinProfitEnabled
+    exitManualHitSL := getPriceCrossExit(CPL.stopLoss, bearExitInputs.SLI.stopLossFlags.manualExitStopEnabled)
+    exitManualHitTP := getPriceCrossAboveExit(CPL.takeProfit, bearExitInputs.TPI.takeProfitFlags.manualExitProfitEnabled)
     bear_tma_InExitRange    = getTMAInRangeExit(bearExit,tmaExitInfo.tmaUpperFast, tmaExitInfo.tmaUpperMain)
     bear_tma_InEntryRange   = entryConf.tmaEntryEnabled ? tmaExitInfo.tmaLowerFast > tmaExitInfo.tmaLowerMain and tmaExitInfo.tmaUpperFast < tmaExitInfo.tmaUpperMain : not entryConf.tmaEntryEnabled
     // set to true if crossed below and required, otherwise keep existing state
@@ -1521,35 +1535,15 @@ getBearEnabled(ExitConfig bearExit, ExitInputs bearExitInputs, tmaConfigInfo tma
     // if required, set to true or false if above vwap else set as true (not required)
     bear_vwapInBuyRange     = (entryConf.vwapEntryRequired ? ePrice > vwapExitInfo.vwapUpper : not entryConf.vwapEntryRequired)
 
-    exitManualHitSL = getPriceCrossExit(CPL.stopLoss, bearExitInputs.SLI.stopLossFlags.manualExitStopEnabled)
-    exitManualHitTP = getPriceCrossAboveExit(CPL.takeProfit, bearExitInputs.TPI.takeProfitFlags.manualExitProfitEnabled)
-    exitManualHit   = exitManualHitSL or exitManualHitTP
-    // manual hit doesn't allow min profit, other take profit trails enforce if enabled
-    // see if Take Profit minimum has crossed or is disabled
-    exitTPMHit = getPriceCrossAboveExit(CPL.minProfit, bearExitInputs.TPI.takeProfitFlags.manualExitProfitEnabled) or not bearExitInputs.TPI.tsMinProfitEnabled
-    // check for valid TMA only required hit
-    exitTMAHit       = getTMACrossExit(bearExit, bearExitInputs, tmaExitInfo.tmaUpperFast, tmaExitInfo.tmaUpperMain, false, false)
-    // capture when no other stops are enabled
-    noStopsRequired  = not bearExitInputs.SLI.stopLossFlags.manualExitStopEnabled and not bearExitInputs.SLI.stopLossFlags.rangeBasedSlEnabled and not bearExitInputs.SLI.stopLossFlags.trailingStopExitEnabled
-    noStopsRequired := noStopsRequired and not bearExitInputs.TPI.takeProfitFlags.manualExitProfitEnabled and not bearExitInputs.TPI.takeProfitFlags.rangeBasedTpEnabled and not bearExitInputs.TPI.takeProfitFlags.trailingProfitEnabled
-    noStopsRequired := noStopsRequired and bearExitInputs.TPI.takeProfitFlags.tmaExitRequired
-    exitTMAHit      := exitTMAHit and noStopsRequired
-    // Non-Exclusive hits (crossing valid, but requires additional indicator hits)
-    crossTMAHitTP  = getTMACrossExit(bearExit, bearExitInputs, tmaExitInfo.tmaUpperFast, tmaExitInfo.tmaUpperMain, true, false)
-    crossTMAHitTP := crossTMAHitTP and exitTPMHit
-    crossTMAHitSL  = getTMACrossExit(bearExit, bearExitInputs, tmaExitInfo.tmaUpperFast, tmaExitInfo.tmaUpperMain, false, true)
-    // Trailing Profit check
-    exitTPHit = getPriceCrossAboveExit(CPL.takeProfit, bearExitInputs.TPI.takeProfitFlags.trailingProfitEnabled)
-    exitTPHit := exitTPHit and exitTPMHit
-    // Stop Loss check
-    exitSLHit = getPriceCrossExit(CPL.stopLoss, bearExitInputs.SLI.stopLossFlags.rangeBasedSlEnabled or bearExitInputs.SLI.stopLossFlags.trailingStopExitEnabled)
-    // Trailing Stop check
-    exitTLSHit = getPriceCrossExit(CPL.stopLoss, bearExitInputs.SLI.stopLossFlags.trailingStopExitEnabled or bearExitInputs.SLI.stopLossFlags.rangeBasedSlEnabled)
-    // check for short exit
-    exitShortSignal = false
-    exitLongSignal = false
+
     switch posDir
         PositionDirection.SHORT =>
+            exitSLHit  := getPriceCrossExit(CPS.stopLoss, bearExitInputs.SLI.stopLossFlags.rangeBasedSlEnabled or bearExitInputs.SLI.stopLossFlags.trailingStopExitEnabled)
+            exitTLSHit := getPriceCrossExit(CPS.stopLoss, bearExitInputs.SLI.stopLossFlags.trailingStopExitEnabled or bearExitInputs.SLI.stopLossFlags.rangeBasedSlEnabled)
+            exitTPHit  := getPriceCrossAboveExit(CPS.takeProfit, bearExitInputs.TPI.takeProfitFlags.trailingProfitEnabled)
+            exitTPMHit := getPriceCrossAboveExit(CPS.minProfit, bearExitInputs.TPI.takeProfitFlags.manualExitProfitEnabled) or not bearExitInputs.TPI.tsMinProfitEnabled
+            exitManualHitSL := getPriceCrossExit(CPS.stopLoss, bearExitInputs.SLI.stopLossFlags.manualExitStopEnabled)
+            exitManualHitTP := getPriceCrossAboveExit(CPS.takeProfit, bearExitInputs.TPI.takeProfitFlags.manualExitProfitEnabled)
             CPS.signals.takeProfitSignal := CPS.active and (close < CPS.takeProfit) and (close < CPS.minProfit)
             CPS.signals.stopSignal       := (close > CPS.stopLoss) and CPS.active
             exitShortSignal              := CPS.signals.takeProfitSignal or CPS.signals.stopSignal
@@ -1557,7 +1551,21 @@ getBearEnabled(ExitConfig bearExit, ExitInputs bearExitInputs, tmaConfigInfo tma
             CPL.signals.takeProfitSignal := CPL.active and (close > CPL.takeProfit) and (close > CPL.minProfit)
             CPL.signals.stopSignal       := (close < CPL.stopLoss) and CPL.active
             exitLongSignal               := CPL.signals.takeProfitSignal or CPL.signals.stopSignal
-   // any signal hit check
+
+    exitManualHit   = exitManualHitSL or exitManualHitTP
+    exitTMAHit       = getTMACrossExit(bearExit, bearExitInputs, tmaExitInfo.tmaUpperFast, tmaExitInfo.tmaUpperMain, false, false)
+    // capture when no other stops are enabled
+    noStopsRequired  = not bearExitInputs.SLI.stopLossFlags.manualExitStopEnabled and not bearExitInputs.SLI.stopLossFlags.rangeBasedSlEnabled and not bearExitInputs.SLI.stopLossFlags.trailingStopExitEnabled
+    noStopsRequired := noStopsRequired and not bearExitInputs.TPI.takeProfitFlags.manualExitProfitEnabled and not bearExitInputs.TPI.takeProfitFlags.rangeBasedTpEnabled and not bearExitInputs.TPI.takeProfitFlags.trailingProfitEnabled
+    noStopsRequired := noStopsRequired and not bearExitInputs.TPI.takeProfitFlags.tmaExitRequired
+    exitTMAHit      := exitTMAHit and noStopsRequired
+    // Non-Exclusive hits (crossing valid, but requires additional indicator hits)
+    crossTMAHitTP  = getTMACrossExit(bearExit, bearExitInputs, tmaExitInfo.tmaUpperFast, tmaExitInfo.tmaUpperMain, true, false)
+    crossTMAHitTP := crossTMAHitTP and exitTPMHit
+    crossTMAHitSL  = getTMACrossExit(bearExit, bearExitInputs, tmaExitInfo.tmaUpperFast, tmaExitInfo.tmaUpperMain, false, true)
+    // Trailing Profit and min profit check
+    exitTPHit := exitTPHit and exitTPMHit
+     // any signal hit check
     exitStopHit = exitTPHit or exitSLHit or exitTLSHit or exitTMAHit or exitManualHit or exitShortSignal or exitLongSignal
     // Exclusive indicator hits combined with tma/vwap conditional (defaulted to true is not required)
     signalHit := (exitStopHit and bearVwapInSellRange and bear_tma_InExitRange) ? true : signalHit // any indicator hit and vwap/tma per requirements
@@ -1709,13 +1717,13 @@ switch posDir
     PositionDirection.NONE =>
         if debugBear or debugDeep
             log.info('update stops skipped, no active trade direction : posDir {0}', str.tostring(posDir))
-bearEnabled      = false
-bearEnabled     := getBearEnabled(exitConf, exitInputs, tmaInfo, vwapInfo) and posDir == PositionDirection.LONG
+bearExitSignal      = false
+bearExitSignal     := getBearExitSignal(exitConf, exitInputs, tmaInfo, vwapInfo) and posDir == PositionDirection.LONG
 shortExitEnabled = getTMAExitSignal(exitInputs, tmaMain, lowerFast, lowerMain, PositionDirection.SHORT) and CPS.active and shortEnabled
-bearSignal       = (bearEnabled or shortExitEnabled) and tradeActive and inTestingRange and sessionOK
+bearSignal       = (bearExitSignal or shortExitEnabled) and tradeActive and inTestingRange and sessionOK
 
 if debugBear or debugSignals
-    log.info('bearSignal = ' + str.tostring(bearSignal) + ' bearEnabled = ' + str.tostring(bearEnabled) + ' profitMin = ' + str.tostring(tsInputs.trailingStopMinProfit))
+    log.info('bearSignal = ' + str.tostring(bearSignal) + ' bearExitSignal = ' + str.tostring(bearExitSignal) + ' profitMin = ' + str.tostring(tsInputs.trailingStopMinProfit))
 
 // Create default null values and calculate state for plot and plotshape if trades are active, done after updating the CPL UDT and checking for bearSignal
 // setup valid hits of individual indicators
@@ -1809,7 +1817,7 @@ if debugSignals  and debugDeep
 // Calculate signal price marker positions with offsets for chart
 
 bullSignalPrice             = bullSignal             ? lowerMain - signalOffset * pipSize : na
-bearSignalPrice             = bearEnabled            ? upperMain + signalOffset * pipSize : na
+bearSignalPrice             = bearExitSignal            ? upperMain + signalOffset * pipSize : na
 takeProfitSignalPrice       = takeProfitSignal       ? upperMain + signalOffset * pipSize : na //above
 rangeStopSignalPrice        = rangeStopLossSignal    ? lowerMain - signalOffset * pipSize : na //below
 manualExitProfitSignalPrice = manualExitProfitSignal ? upperMain + signalOffset * pipSize : na  //above
