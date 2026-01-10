@@ -1,5 +1,5 @@
 //@version=6
-// MJ 08-Jan-2026
+// MJ 10-Jan-2026
 strategy('STT Trade Plan Directional', overlay=true, initial_capital=1000, default_qty_type=strategy.fixed, default_qty_value=200, process_orders_on_close=true, pyramiding=0)
 import TradingView/ta/11
 
@@ -1914,6 +1914,7 @@ if canEnter
     posDir := (CPL.signals.bullSignal ? PositionDirection.LONG : (CPS.signals.bearEntrySignal ? PositionDirection.SHORT : PositionDirection.NONE ))
     float gapClose = ePrice
     gapClose := math.round((ePrice + orderEnterGap), 2)
+    enterLimitPrice = math.floor(ePrice * 100.0) / 100.0
     if enableAlerts   
         if debugBull
             log.info('canEnter triggered - Entered if block')
@@ -1934,15 +1935,14 @@ if canEnter
                     // include stop/profit targets in the traderpost json
                     alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + syminfo.ticker + '",\n"action": "buy",\n "quantityType": "dollar_amount",\n "quantity": ' + str.tostring(tpQuantity)
                     alertMessage := alertMessage + ',\n "no_add": true,\n "takeProfit":{\n "percent": ' + str.tostring(tpTp) + '\n },\n "stopLoss":{\n "type": "stop",\n "percent": '
-                    alertMessage := alertMessage + str.tostring(tpSl) + '},\n"orderType": "limit",\n"limitPrice": '+ str.tostring(gapClose) + '\n}'
+                    alertMessage := alertMessage + str.tostring(tpSl) + '},\n"orderType": "stop_limit",\n"limitPrice": '+ str.tostring(enterLimitPrice) + ',\n"stopPrice": ' + str.tostring(gapClose) + '\n}'
                     if debug 
                         log.info('{0} : \n : {1}', scriptName, alertMessage)
                 else
                     // no stop/profit targets in the traderpost json
                     alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + syminfo.ticker + '",\n"action": "buy",\n "quantityType": "dollar_amount",\n "quantity": '
-                    alertMessage += str.tostring(tpQuantity) + ',\n "no_add": true,\n "orderType": "limit",\n"limitPrice": '+ str.tostring(gapClose) + '\n}'
-                    if debug 
-                        log.info('{0} : \n : {1}', scriptName, alertMessage)
+                    alertMessage += str.tostring(tpQuantity) + ',\n "no_add": true,\n "orderType": "stop_limit",\n"limitPrice": '+ str.tostring(enterLimitPrice) + ',\n"stopPrice": ' + str.tostring(gapClose) + '\n}'
+                    log.info('{0} : \n : {1}', scriptName, alertMessage)
                 if enableAlertsEnter and rtBarStatus
                     log.info('BUY alert trigger fired')
                     alertTitle := str.tostring(syminfo.ticker) + 'BUY triggered.'
@@ -2005,6 +2005,7 @@ if (canExit and inTestingRange and tradeActive and sessionOK) or dailyExitInRang
     if debugDeep
         log.info('Entered exit : mustExit : {0}', mustExit)
     float gapClose = math.round((ePrice - orderExitGap), 2)
+    float exitLimitPrice = math.floor(ePrice * 100.0) / 100.0
     if debugDeep or debugBear
         log.info('Entered canExit at {0}', ePrice)
         log.info('canExit {0}, inTestingRange {1}, mustExit : {2}', canExit, inTestingRange, mustExit)
@@ -2029,7 +2030,7 @@ if (canExit and inTestingRange and tradeActive and sessionOK) or dailyExitInRang
     if mustExit
         log.info('EOD closure triggered')
     if enableAlerts
-        alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + str.tostring(syminfo.ticker) + '",\n"action": "exit",\n"orderType": "limit",\n"limitPrice": '+ str.tostring(gapClose) + '\n}'
+        alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + str.tostring(syminfo.ticker) + '",\n"action": "exit",\n"orderType": "stop_limit",\n"limitPrice": '+ str.tostring(exitLimitPrice) + ',\n"stopPrice": ' + str.tostring(gapClose) + '\n}'
         alertTitle := str.tostring(syminfo.ticker) + 'SELL triggered'
         if debug
             log.info('{0} : \n : {1}', scriptName, alertMessage)
