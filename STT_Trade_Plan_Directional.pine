@@ -1,5 +1,5 @@
 //@version=6
-// MJ 10-Jan-2026
+// MJ 08-Jan-2026
 strategy('STT Trade Plan Directional', overlay=true, initial_capital=1000, default_qty_type=strategy.fixed, default_qty_value=200, process_orders_on_close=true, pyramiding=0)
 import TradingView/ta/11
 
@@ -60,7 +60,7 @@ bool closeDaily = input.bool(false, "Enable Daily Close", group = 'Trade Entry T
 tradeDirectionSelected = input.enum(TradeDirection.Long, title='Trade types allowed', group = 'Trade Entry Triggers', tooltip = 'Type of trades Long, Short or both that backtesting and alert will get triggered.')
 int dailyEntryWindowStartHour = input.int(8, title="Hour (ET) to begin allowing trade entry", minval = 4, maxval = 19, group = 'Trade Time Triggers')
 int dailyEntryWindowStartMinute = input.int(30, title="Minutes after Hour to begin allowing trade entry", minval = 0, step = 15, maxval = 45, group = 'Trade Time Triggers')
-int dailyExitWindowStartHour = input.int(15, title="Hour (ET) to force daily trade exits", minval = 11, maxval = 19, group = 'Trade Time Triggers')
+int dailyExitWindowStartHour = input.int(3, title="Hour (ET) to force daily trade exits", minval = 3, maxval = 19, group = 'Trade Time Triggers')
 int dailyExitWindowStartMinute = input.int(45, title="Minutes after Hour to force trade exits", minval = 0, step = 15, maxval = 45, group = 'Trade Time Triggers')
 int exitBufferMinutes = input.int(15, title="Force Exit Buffer Minutes", minval = 15, maxval = 59, step=5, group = 'Trade Time Triggers')
 bool allowETH = input.bool(false, title="Allow Trading Alerts in Extended Hours", group = 'Trade Time Triggers')
@@ -1655,8 +1655,8 @@ vwapLower     = vwapMain - vwapMultiplier * vwapDeviation
 // SIGNAL DETECTION
 // =================================================================
 
-EODE = getEndOfDayExit()
-dailyExitInRange = sessionOK and not eodExitFiredToday and time_close >= exitStart  and time_close < exitEnd and closeDaily and tradeActive
+
+
 
 if debugPrice and isNewLogBar 
     //log.info("New {1}-minute debug display interval started at: {0}", str.format_time(time, "HH:mm:ss"), debugInterval)
@@ -1875,7 +1875,10 @@ if debugSignals
     log.info('INLINE-03 canEnter : {0}, bullSignal : {1}', canEnter, bullSignal)
 // Create the validation flag for exiting, default to false
 canExit  = tradeActive
-mustExit = dailyExitInRange and tradeActive
+dailyExitInRange = time_close >= exitStart  and time_close < exitEnd and closeDaily and tradeActive and not eodExitFiredToday
+EODE = getEndOfDayExit() or dailyExitInRange
+eodExitFiredToday := EODE
+mustExit = EODE and tradeActive
 
 // Check required indicators state and update based on condition
 // if position type variable has a current active trade enabled and any of the signals have been triggered, set canExit to true
@@ -1910,7 +1913,7 @@ if canEnter
     if barstate.isrealtime and not barstate.isrealtime[1]
         log.warning("🔴 canEnter ENTERED REALTIME MODE @ {0}", time)
     ePrice := getPrice(mainTriggerPriceType)
-    
+    eodExitFiredToday := false
     posDir := (CPL.signals.bullSignal ? PositionDirection.LONG : (CPS.signals.bearEntrySignal ? PositionDirection.SHORT : PositionDirection.NONE ))
     float gapClose = ePrice
     gapClose := math.round((ePrice + orderEnterGap), 2)
@@ -1999,7 +2002,7 @@ if debugBear
 safetyClose = (ta.change(time("D")) != 0) and tradeActive and closeDaily
 
 // log.info('mustExit p2 {0}, inTestingRange {1}, canExit : {2}', mustExit, inTestingRange, canExit)
-if (canExit and inTestingRange and tradeActive and sessionOK) or dailyExitInRange or safetyClose
+if (canExit and inTestingRange and tradeActive and sessionOK) or dailyExitInRange or safetyClose or mustExit
     // Valid exit state, on realtime bar, perform strategy exit if realtime bar is confirmed
     strategy.close_all()
     if debugDeep
