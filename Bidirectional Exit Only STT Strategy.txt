@@ -1,12 +1,11 @@
 //@version=6
-// MJ 08-Jan-2025
-strategy('STT Exit-Only Trade Plan Directional', overlay=true, initial_capital=1000, default_qty_type=strategy.cash, default_qty_value=200, process_orders_on_close=true, pyramiding=0)
+// MJ 10-Jan-2026
+strategy('STT Trade Plan Directional', overlay=true, initial_capital=1000, default_qty_type=strategy.fixed, default_qty_value=200, process_orders_on_close=true, pyramiding=0)
 import TradingView/ta/11
 
 // Setup the ability to have a label with the name of the script on the chart and use it in logging/debug statements
-scriptName = input.string('STT Exit-Only Trade Plan Directional Strategy', 'Script Title')
+scriptName = input.string('STT Trade Directional Strategy', 'Script Title')
 showLabel = input.bool(false, "Show label on chart?")
-
 
 if showLabel
     lbl = label.new(bar_index, high, scriptName, style=label.style_label_down)
@@ -56,15 +55,15 @@ primaryEntryType = input.string('Price', 'Entry Type', ['Price','Breakout','TMA-
 //additionalEntryTypeLogic = input.string('or', 'Entry Type Addition Logical Method', ['and','or'], group = 'Trade Entry Triggers', confirm=true, display=display.data_window)
 additionalEntryTypeLogic = input.string('or', 'Entry Type Addition Logical Method', ['and','or'], group = 'Trade Entry Triggers', confirm=true, display=display.data_window)
 mainTriggerPriceType = input.string('Close', 'Price Trigger Type', options = ['Close', 'Open', 'High', 'Low', 'Median', 'Typical', 'Weighted'], group = 'Trade Entry Triggers', display=display.data_window)
-bool oneSignalPerDay  = input.bool(false, "Limit Only One Trade Per Day", group = 'Trade Entry Triggers', confirm=true, display=display.data_window)
+bool oneSignalPerDay  = input.bool(true, "Limit Only One Trade Per Day", group = 'Trade Entry Triggers', confirm=true, display=display.data_window)
 bool closeDaily = input.bool(false, "Enable Daily Close", group = 'Trade Entry Triggers', tooltip='When enabled all trades will be exited at time selected.',confirm=true, display=display.data_window)
 tradeDirectionSelected = input.enum(TradeDirection.Long, title='Trade types allowed', group = 'Trade Entry Triggers', tooltip = 'Type of trades Long, Short or both that backtesting and alert will get triggered.')
-int dailyEntryWindowStartHour = input.int(7, title="Hour (ET) to begin allowing trade entry", minval = 4, maxval = 19, group = 'Trade Time Triggers')
+int dailyEntryWindowStartHour = input.int(8, title="Hour (ET) to begin allowing trade entry", minval = 4, maxval = 19, group = 'Trade Time Triggers')
 int dailyEntryWindowStartMinute = input.int(30, title="Minutes after Hour to begin allowing trade entry", minval = 0, step = 15, maxval = 45, group = 'Trade Time Triggers')
 int dailyExitWindowStartHour = input.int(15, title="Hour (ET) to force daily trade exits", minval = 11, maxval = 19, group = 'Trade Time Triggers')
 int dailyExitWindowStartMinute = input.int(45, title="Minutes after Hour to force trade exits", minval = 0, step = 15, maxval = 45, group = 'Trade Time Triggers')
 int exitBufferMinutes = input.int(15, title="Force Exit Buffer Minutes", minval = 15, maxval = 59, step=5, group = 'Trade Time Triggers')
-bool allowETH = input.bool(true, title="Allow Trading Alerts in Extended Hours", group = 'Trade Time Triggers')
+bool allowETH = input.bool(false, title="Allow Trading Alerts in Extended Hours", group = 'Trade Time Triggers')
 // SuperNova LowFloat Breakout Settings
 int triggerHour   = input.int(9, "Trigger Entry Enable Hour (ET)", group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
 int triggerMinute = input.int(45, "Trigger Entry Enable Minute", group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
@@ -124,7 +123,7 @@ fastDeviations = input.float(3.4, 'Bands Multiplier', minval = 0.1, step = 0.1, 
 signalOffset = input.int(5, 'Signal Arrow Offset (pips)', minval = 0, group = 'Signal Settings', display=display.data_window)
 // Alert Settings
 enableAlerts = input.bool(true, 'Enable Alerts', group = 'Alert Settings', display=display.data_window)
-enableAlertsEnter = input.bool(false, 'Enable Buy Signal', group = 'Alert Settings', display=display.data_window)
+enableAlertsEnter = input.bool(true, 'Enable Buy Signal', group = 'Alert Settings', display=display.data_window)
 enableAlertsExit = input.bool(true, 'Enable Sell Signal', group = 'Alert Settings', display=display.data_window)
 debug = input.bool(true, title='Debug', group = 'Alert Settings', tooltip='Enables JSON info logging.', display=display.data_window)
 debugDeep = input.bool(false, title='Deep Debug', group = 'Alert Settings', tooltip='Enables extra logging to show variables.', display=display.data_window)
@@ -1915,6 +1914,7 @@ if canEnter
     posDir := (CPL.signals.bullSignal ? PositionDirection.LONG : (CPS.signals.bearEntrySignal ? PositionDirection.SHORT : PositionDirection.NONE ))
     float gapClose = ePrice
     gapClose := math.round((ePrice + orderEnterGap), 2)
+    enterLimitPrice = math.floor(ePrice * 100.0) / 100.0
     if enableAlerts   
         if debugBull
             log.info('canEnter triggered - Entered if block')
@@ -1935,15 +1935,14 @@ if canEnter
                     // include stop/profit targets in the traderpost json
                     alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + syminfo.ticker + '",\n"action": "buy",\n "quantityType": "dollar_amount",\n "quantity": ' + str.tostring(tpQuantity)
                     alertMessage := alertMessage + ',\n "no_add": true,\n "takeProfit":{\n "percent": ' + str.tostring(tpTp) + '\n },\n "stopLoss":{\n "type": "stop",\n "percent": '
-                    alertMessage := alertMessage + str.tostring(tpSl) + '},\n"orderType": "limit",\n"limitPrice": '+ str.tostring(gapClose) + '\n}'
+                    alertMessage := alertMessage + str.tostring(tpSl) + '},\n"orderType": "stop_limit",\n"limitPrice": '+ str.tostring(enterLimitPrice) + ',\n"stopPrice": ' + str.tostring(gapClose) + '\n}'
                     if debug 
                         log.info('{0} : \n : {1}', scriptName, alertMessage)
                 else
                     // no stop/profit targets in the traderpost json
                     alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + syminfo.ticker + '",\n"action": "buy",\n "quantityType": "dollar_amount",\n "quantity": '
-                    alertMessage += str.tostring(tpQuantity) + ',\n "no_add": true,\n "orderType": "limit",\n"limitPrice": '+ str.tostring(gapClose) + '\n}'
-                    if debug 
-                        log.info('{0} : \n : {1}', scriptName, alertMessage)
+                    alertMessage += str.tostring(tpQuantity) + ',\n "no_add": true,\n "orderType": "stop_limit",\n"limitPrice": '+ str.tostring(enterLimitPrice) + ',\n"stopPrice": ' + str.tostring(gapClose) + '\n}'
+                    log.info('{0} : \n : {1}', scriptName, alertMessage)
                 if enableAlertsEnter and rtBarStatus
                     log.info('BUY alert trigger fired')
                     alertTitle := str.tostring(syminfo.ticker) + 'BUY triggered.'
@@ -2006,6 +2005,7 @@ if (canExit and inTestingRange and tradeActive and sessionOK) or dailyExitInRang
     if debugDeep
         log.info('Entered exit : mustExit : {0}', mustExit)
     float gapClose = math.round((ePrice - orderExitGap), 2)
+    float exitLimitPrice = math.floor(ePrice * 100.0) / 100.0
     if debugDeep or debugBear
         log.info('Entered canExit at {0}', ePrice)
         log.info('canExit {0}, inTestingRange {1}, mustExit : {2}', canExit, inTestingRange, mustExit)
@@ -2030,7 +2030,7 @@ if (canExit and inTestingRange and tradeActive and sessionOK) or dailyExitInRang
     if mustExit
         log.info('EOD closure triggered')
     if enableAlerts
-        alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + str.tostring(syminfo.ticker) + '",\n"action": "exit",\n"orderType": "limit",\n"limitPrice": '+ str.tostring(gapClose) + '\n}'
+        alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + str.tostring(syminfo.ticker) + '",\n"action": "exit",\n"orderType": "stop_limit",\n"limitPrice": '+ str.tostring(exitLimitPrice) + ',\n"stopPrice": ' + str.tostring(gapClose) + '\n}'
         alertTitle := str.tostring(syminfo.ticker) + 'SELL triggered'
         if debug
             log.info('{0} : \n : {1}', scriptName, alertMessage)
