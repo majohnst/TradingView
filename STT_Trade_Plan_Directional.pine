@@ -1,5 +1,5 @@
 //@version=6
-// MJ 08-Jan-2026
+// MJ 10-Jan-2026
 strategy('STT Trade Plan Directional', overlay=true, initial_capital=1000, default_qty_type=strategy.fixed, default_qty_value=200, process_orders_on_close=true, pyramiding=0)
 import TradingView/ta/11
 
@@ -561,28 +561,30 @@ if isNewDay
     dailyLimitReached := false
     eodExitFiredToday := false
 
-
 dailyExitStartTime = dayStart + (dailyExitWindowStartHour * 60 + dailyExitWindowStartMinute) * 60 * 1000
 dailyEntryStartTime = dayStart + (dailyEntryWindowStartHour * 60 + dailyEntryWindowStartMinute) * 60 * 1000
 //entrySessionStr = str.format("{0:02d}{1:02d}-{2:02d}{3:02d}", dailyEntryWindowStartHour, dailyEntryWindowStartMinute, dailyExitWindowStartHour, dailyExitWindowStartMinute)
 entrySessionStr = pad2(dailyEntryWindowStartHour) + pad2(dailyEntryWindowStartMinute) + "-" + pad2(dailyExitWindowStartHour)  + pad2(dailyExitWindowStartMinute)
 inSession = not na(time(timeframe.period, entrySessionStr))
+sessionEnd = allowETH ? "2000" : "1600"
+exitRangeStr = pad2(dailyExitWindowStartHour) + pad2(dailyExitWindowStartMinute) + "-" + sessionEnd
+inExitOnlyWindowPeriod = not na(time(timeframe.period, exitRangeStr))
 //bool inDailyRange = time >= dailyEntryStartTime and time_close <= dailyExitStartTime 
 
 // generate the times allowed for entries and exits
 entryStart = f_timeToday(dayStart, dailyEntryWindowStartHour, dailyEntryWindowStartMinute)
 exitStart = f_timeToday(dayStart, dailyExitWindowStartHour, dailyExitWindowStartMinute)
-exitEnd = exitStart + exitBufferMinutes * 60 * 1000
+exitEnd = f_timeToday(dayStart, dailyExitWindowStartHour, dailyExitWindowStartMinute + exitBufferMinutes)
+// exitStart + exitBufferMinutes * 60 * 1000
 // global variable setting trading allowed window
-inRTH = not na(time(timeframe.period, "0930-1545"))
-inETH = not na(time(timeframe.period, "0700-1930"))
+inRTH = not na(time(timeframe.period, "0930-1600"))
+inETH = not na(time(timeframe.period, "0700-2000"))
 // allow override via input of the trading hours
 sessionOK = allowETH ? inETH : inRTH
 // use the override window (include extended hours ETH) or the restricted market hours (RTH) - limited by the entry start/exit enforced time
-inEntryWindow = (sessionOK and time >= entryStart and time_close < exitStart)  or (inRTH and time >= entryStart and time_close < exitStart)
+inEntryWindow = (sessionOK and time >= entryStart and time_close < exitStart)
 // force daily exit flags/values, true if in range and enabled, false if outside exit time window, or false if disabled
 // bool inDailyRange = inSession and time >= dailyEntryStartTime and time_close <= dailyExitStartTime
-
 shortEnabled = false
 longEnabled = true
 tpManualPrice  = exitInputs.TPI.manualExitProfitPrice
@@ -1392,18 +1394,20 @@ getBullEnabled(LongEntryInputs bullEntryConf, float curPrice, vwapConfigInfo vwa
         log.info('bullsignal = ' + str.tostring(bullSignal))
     bullSignal
 
+
 getEndOfDayExit() =>
     safetyClose = (ta.change(time("D")) != 0) and tradeActive and closeDaily
     eodResult = false
-    inExitAlertWindow = sessionOK and not eodExitFiredToday and time >= exitStart and time < exitEnd
+    inExitAlertWindow = inExitOnlyWindowPeriod and tradeActive and closeDaily and not eodExitFiredToday
+    // sessionOK and not eodExitFiredToday and time >= exitStart
     eodResult := switch eodExitFiredToday
         false =>
             CPL.signals.eodExitSignal := true
             CPS.signals.eodExitSignal := true
-            (closeDaily and inExitAlertWindow and tradeActive) or safetyClose 
+            inExitAlertWindow or safetyClose 
         true => 
             false
-    eodResult and closeDaily and tradeActive
+    eodResult
 getTMAExitSignal(
     ExitInputs exitConf,
     float tma,
@@ -1870,15 +1874,14 @@ plotshape(trailingExitSignalPrice, 'Trailing Stop Signal', shape.diamond, locati
 // ALERTS & Strategy Entry/Exit
 // ============================================================================
 //
-canEnter = (not tradeActive) and (bullSignal or shortEntrySignal) and inTestingRange and (not dailyLimitReached) and sessionOK
+canEnter = (not tradeActive) and (bullSignal or shortEntrySignal) and inTestingRange and (not dailyLimitReached) and inEntryWindow
 if debugSignals 
     log.info('INLINE-03 canEnter : {0}, bullSignal : {1}', canEnter, bullSignal)
 // Create the validation flag for exiting, default to false
 canExit  = tradeActive
-dailyExitInRange = time_close >= exitStart  and time_close < exitEnd and closeDaily and tradeActive and not eodExitFiredToday
-EODE = getEndOfDayExit() or dailyExitInRange
-eodExitFiredToday := EODE
-mustExit = EODE and tradeActive
+dailyExitInRange = time >= exitStart and closeDaily and tradeActive and not eodExitFiredToday
+mustExit = getEndOfDayExit() and tradeActive and closeDaily
+
 
 // Check required indicators state and update based on condition
 // if position type variable has a current active trade enabled and any of the signals have been triggered, set canExit to true
@@ -1908,7 +1911,7 @@ if debugSignals
 if debugBear 
     log.info('CPL : {0} ', dumpPosition(CPL))
     log.info('CPS : {0} ', dumpPosition(CPS))
-if canEnter
+if canEnter and not inExitOnlyWindowPeriod
     // Valid entry codition, continue to enter strategy if realtime bar is confirmed
     if barstate.isrealtime and not barstate.isrealtime[1]
         log.warning("🔴 canEnter ENTERED REALTIME MODE @ {0}", time)
@@ -1989,6 +1992,8 @@ if canEnter
     if (debugBull) // and rtBarStatus
         log.info('Post Entry state : direct : {0}', str.tostring(CPL.direction))
         log.info(str.tostring(dumpPosition(CPL)))
+    log.info('entryStart {0} exitStart {1} inSession {2} exitEnd {3}', entryStart, exitStart, inSession, exitEnd)
+
 
 if debugBear 
     // debug to validate canExit and triggers
@@ -2002,9 +2007,10 @@ if debugBear
 safetyClose = (ta.change(time("D")) != 0) and tradeActive and closeDaily
 
 // log.info('mustExit p2 {0}, inTestingRange {1}, canExit : {2}', mustExit, inTestingRange, canExit)
-if (canExit and inTestingRange and tradeActive and sessionOK) or dailyExitInRange or safetyClose or mustExit
+if (canExit and inTestingRange and tradeActive and sessionOK) or mustExit
     // Valid exit state, on realtime bar, perform strategy exit if realtime bar is confirmed
     strategy.close_all()
+    log.info('entryStart {0} exitStart {1} inSession {2} exitEnd {3}', entryStart, exitStart, inSession, exitEnd)
     if debugDeep
         log.info('Entered exit : mustExit : {0}', mustExit)
     float gapClose = math.round((ePrice - orderExitGap), 2)
