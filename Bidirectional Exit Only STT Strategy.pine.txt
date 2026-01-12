@@ -541,9 +541,9 @@ takeProfit_inputs := manualPriceOnly ? TakeProfitInputs.new('Fixed-Price', 'and'
 ShortStopInputs exitInputsShort = makeShortStopInputs(tmaCrossingType, rangeBased,shortBasedInit,tsAmount, tsMinProfit, tsAmount, tsMinProfitEnabled, trailingStopMinProfit, exitConfShort)
 ExitInputs exitInputs = ExitInputs.new(stopLoss_inputs, takeProfit_inputs, exitInputsShort)
 var breakoutConfig breakoutConf = makeBreakoutConfig(floatSize, volumeMultiplier, percentGain, triggerHour, triggerMinute, usePreMarketHigh)
+var bool eodExitFiredToday  = false
+var dailyLimitReached       = false
 
-// exitTime = timestamp(syminfo.timezone, year, month, dayofmonth, dailyExitWindowStartHour, dailyExitWindowStartMinute)
-// entryTime = timestamp(syminfo.timezone, year, month, dayofmonth, dailyEntryWindowStartHour, dailyEntryWindowStartMinute)
 // ======== Session Helper Functions ===========
 pad2(x) =>
     x < 10 ? "0" + str.tostring(x) : str.tostring(x)
@@ -551,43 +551,60 @@ pad2(x) =>
 f_timeToday(dayST, h , m) =>
     dayST + (h * 60 + m) * 60 * 1000
 
-dayStart = time("D")
-bool isNewDay = ta.change(time("D")) != 0
-var bool eodExitFiredToday  = false
-var dailyLimitReached       = false
+exYear  = year(time, syminfo.timezone)
+exMonth = month(time, syminfo.timezone)
+exDay   = dayofmonth(time, syminfo.timezone)
+exHour   = hour(time, syminfo.timezone)
+exMinute = minute(time, syminfo.timezone)
+dayStart = timestamp(syminfo.timezone, exYear, exMonth, exDay, 0, 0)
+
+bool isNewDay = ta.change(dayStart) != 0
+// dayStart = time("D")
+// bool isNewDay = ta.change(time("D")) != 0
+
 // Daily reset
 if isNewDay
     breakoutConf := makeBreakoutConfig(floatSize, volumeMultiplier, percentGain, triggerHour, triggerMinute, usePreMarketHigh)
     dailyLimitReached := false
     eodExitFiredToday := false
 
-dailyExitStartTime = dayStart + (dailyExitWindowStartHour * 60 + dailyExitWindowStartMinute) * 60 * 1000
-dailyEntryStartTime = dayStart + (dailyEntryWindowStartHour * 60 + dailyEntryWindowStartMinute) * 60 * 1000
-//entrySessionStr = str.format("{0:02d}{1:02d}-{2:02d}{3:02d}", dailyEntryWindowStartHour, dailyEntryWindowStartMinute, dailyExitWindowStartHour, dailyExitWindowStartMinute)
-entrySessionStr = pad2(dailyEntryWindowStartHour) + pad2(dailyEntryWindowStartMinute) + "-" + pad2(dailyExitWindowStartHour)  + pad2(dailyExitWindowStartMinute)
-inSession = not na(time(timeframe.period, entrySessionStr))
-sessionEnd = allowETH ? "2000" : "1600"
+// dailyExitStartTime = dayStart + (dailyExitWindowStartHour * 60 + dailyExitWindowStartMinute) * 60 * 1000
+// dailyEntryStartTime = dayStart + (dailyEntryWindowStartHour * 60 + dailyEntryWindowStartMinute) * 60 * 1000
+// entrySessionStr = pad2(dailyEntryWindowStartHour) + pad2(dailyEntryWindowStartMinute) + "-" + pad2(dailyExitWindowStartHour)  + pad2(dailyExitWindowStartMinute)
+
+sessionEnd = allowETH ? "20" : "16"
 exitRangeStr = pad2(dailyExitWindowStartHour) + pad2(dailyExitWindowStartMinute) + "-" + sessionEnd
-inExitOnlyWindowPeriod = not na(time(timeframe.period, exitRangeStr))
-//bool inDailyRange = time >= dailyEntryStartTime and time_close <= dailyExitStartTime 
+dailyExitHour = allowETH ? 19 : 15
 
-// generate the times allowed for entries and exits
-entryStart = f_timeToday(dayStart, dailyEntryWindowStartHour, dailyEntryWindowStartMinute)
-exitStart = f_timeToday(dayStart, dailyExitWindowStartHour, dailyExitWindowStartMinute)
-exitEnd = f_timeToday(dayStart, dailyExitWindowStartHour, dailyExitWindowStartMinute + exitBufferMinutes)
-// exitStart + exitBufferMinutes * 60 * 1000
-// global variable setting trading allowed window
-inRTH = not na(time(timeframe.period, "0930-1600"))
-inETH = not na(time(timeframe.period, "0700-2000"))
+rthStart = timestamp(syminfo.timezone, exYear, exMonth, exDay, 9, 30)
+rthEnd   = timestamp(syminfo.timezone, exYear, exMonth, exDay, 16, 0)
+
+ethStart = timestamp(syminfo.timezone, exYear, exMonth, exDay, 7, 0)
+ethEnd   = timestamp(syminfo.timezone, exYear, exMonth, exDay, 20, 0)
+
+entryStart = timestamp(syminfo.timezone, exYear, exMonth, exDay, dailyEntryWindowStartHour, dailyEntryWindowStartMinute)
+exitStart = timestamp(syminfo.timezone, exYear, exMonth, exDay, dailyExitHour, 60 - exitBufferMinutes)
+exitEnd = timestamp(syminfo.timezone, exYear, exMonth, exDay, dailyExitHour,59)
+inRTH = (time >= rthStart) and (time < rthEnd)
+inETH = (time >= ethStart) and (time < ethEnd)
+inSession = (time >= entryStart) and (time < exitStart)
+barOpen = time
+barClose = time + timeframe.in_seconds() * 1000
+
+inExitOnlyWindowPeriod = (time_close>= exitStart) and (time_close <= exitEnd)
+
 // allow override via input of the trading hours
-sessionOK = allowETH ? inETH : inRTH
+sessionOK = timeframe.isintraday and (allowETH ? inETH : inRTH)
 // use the override window (include extended hours ETH) or the restricted market hours (RTH) - limited by the entry start/exit enforced time
-
-// inEntryWindow = (sessionOK and time >= entryStart and time_close < exitStart)
-//inEntryWindow = (sessionOK and time >= dailyEntryStartTime and time_close < dailyExitStartTime)
-inEntryWindow = not na(time(timeframe.period, entrySessionStr))
-
-//log.info('inRTH {0} inETH{1} entryHour {2} entryMinute {3} time {4} entryStart {5} exitStart {6} dayStart {7} inSession {8}, inEntryWindow {9}', inRTH, inETH, dailyEntryWindowStartHour, dailyEntryWindowStartMinute, time, entryStart, exitStart, dayStart, inSession, inEntryWindow)
+inEntryWindow = (sessionOK and time >= entryStart and time < exitStart)
+if barstate.islast
+    label.new(bar_index, high,
+        "Chart: " + str.tostring(hour) + ":" + str.tostring(minute) +
+        "\nExchange: " +
+        str.tostring(hour(time, syminfo.timezone)) + ":" +
+        str.tostring(minute(time, syminfo.timezone))
+    )
+log.info('inRTH {0} inETH{1} entryHour {2} entryMinute {3} time {4} entryStart {5} exitStart {6} dayStart {7} inSession {8}, inEntryWindow {9}', inRTH, inETH, dailyEntryWindowStartHour, dailyEntryWindowStartMinute, time, entryStart, exitStart, dayStart, inSession, inEntryWindow)
 // force daily exit flags/values, true if in range and enabled, false if outside exit time window, or false if disabled
 // bool inDailyRange = inSession and time >= dailyEntryStartTime and time_close <= dailyExitStartTime
 shortEnabled = false
@@ -1401,17 +1418,16 @@ getBullEnabled(LongEntryInputs bullEntryConf, float curPrice, vwapConfigInfo vwa
 
 
 getEndOfDayExit() =>
-    safetyClose = (ta.change(time("D")) != 0) and tradeActive and closeDaily
+    eodExitWindow = (barOpen < exitEnd) and (barClose > exitStart)  // overlap check
+    newDay = ta.change(timestamp(syminfo.timezone, exYear, exMonth, exDay, 0, 0)) != 0
+    safetyClose = newDay and tradeActive and closeDaily
     eodResult = false
     inExitAlertWindow = inExitOnlyWindowPeriod and tradeActive and closeDaily and not eodExitFiredToday
     // sessionOK and not eodExitFiredToday and time >= exitStart
-    eodResult := switch eodExitFiredToday
-        false =>
-            CPL.signals.eodExitSignal := true
-            CPS.signals.eodExitSignal := true
-            inExitAlertWindow or safetyClose 
-        true => 
-            false
+    if not eodExitFiredToday and (inExitAlertWindow or safetyClose)
+        CPL.signals.eodExitSignal := true
+        CPS.signals.eodExitSignal := true
+        eodResult := true
     eodResult
 getTMAExitSignal(
     ExitInputs exitConf,
@@ -1884,7 +1900,7 @@ if debugSignals
     log.info('INLINE-03 canEnter : {0}, bullSignal : {1}', canEnter, bullSignal)
 // Create the validation flag for exiting, default to false
 canExit  = tradeActive
-dailyExitInRange = time >= exitStart and closeDaily and tradeActive and not eodExitFiredToday
+dailyExitInRange = time_close >= exitStart and closeDaily and tradeActive and not eodExitFiredToday
 mustExit = getEndOfDayExit() and tradeActive and closeDaily
 
 
@@ -1924,8 +1940,8 @@ if canEnter and not inExitOnlyWindowPeriod
     eodExitFiredToday := false
     posDir := (CPL.signals.bullSignal ? PositionDirection.LONG : (CPS.signals.bearEntrySignal ? PositionDirection.SHORT : PositionDirection.NONE ))
     float gapClose = ePrice
-    gapClose := math.round((ePrice + orderEnterGap), 2)
-    enterLimitPrice = math.floor(ePrice * 100.0) / 100.0
+    enterLimitPrice = math.ceil(ePrice * 100.0) / 100.0
+    gapClose := math.round((enterLimitPrice + orderEnterGap), 2)
     if enableAlerts   
         if debugBull
             log.info('canEnter triggered - Entered if block')
@@ -2018,8 +2034,9 @@ if (canExit and inTestingRange and tradeActive and sessionOK) or mustExit
     log.info('entryStart {0} exitStart {1} inSession {2} exitEnd {3}', entryStart, exitStart, inSession, exitEnd)
     if debugDeep
         log.info('Entered exit : mustExit : {0}', mustExit)
-    float gapClose = math.round((ePrice - orderExitGap), 2)
-    float exitLimitPrice = math.floor(ePrice * 100.0) / 100.0
+    float exitLimitPrice = math.floor(ePrice * 100.0) / 100.0    
+    float gapClose = math.round((exitLimitPrice - orderExitGap), 2)
+    
     if debugDeep or debugBear
         log.info('Entered canExit at {0}', ePrice)
         log.info('canExit {0}, inTestingRange {1}, mustExit : {2}', canExit, inTestingRange, mustExit)
@@ -2043,6 +2060,7 @@ if (canExit and inTestingRange and tradeActive and sessionOK) or mustExit
                 log.info('Exit reason na, posDir set to NONE')
     if mustExit
         log.info('EOD closure triggered')
+        eodExitFiredToday := true
     if enableAlerts
         alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + str.tostring(syminfo.ticker) + '",\n"action": "exit",\n"orderType": "stop_limit",\n"limitPrice": '+ str.tostring(gapClose) + ',\n"stopPrice": ' + str.tostring(exitLimitPrice) + '\n}'
         alertTitle := str.tostring(syminfo.ticker) + 'SELL triggered'

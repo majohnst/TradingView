@@ -131,6 +131,7 @@ debugBull = input.bool(false, title='Deep Bull Debug', group = 'Alert Settings',
 debugBear = input.bool(false, title='Deep Bear Debug', group = 'Alert Settings', tooltip='Enables extra logging to show bear related variables.', display=display.data_window)
 debugSignals = input.bool(false, title='Deep Signal Debug', group = 'Alert Settings', tooltip='Enables extra logging to show signal related variables.', display=display.data_window)
 debugPrice = input.bool(false, title='Deep Price Action Debug', group = 'Alert Settings', tooltip='Enables extra logging to show bearprices, stops, and profits related variables.', display=display.data_window)
+debugTime = input.bool(false, title='Time Info Debug', group = 'Alert Settings', tooltip='Enables extra logging to show time variables.', display=display.data_window)
 
 debugInterval = input.string('5', options=['1','2','5','10', '15', '20', '30', '60', '120', '240', '480', '1440'], title='Debug Interval', group='Alert Settings', tooltip='For debugging that hits every tick, only show it the number of minutes apart.')
 
@@ -587,7 +588,8 @@ sessionOK = allowETH ? inETH : inRTH
 //inEntryWindow = (sessionOK and time >= dailyEntryStartTime and time_close < dailyExitStartTime)
 inEntryWindow = not na(time(timeframe.period, entrySessionStr))
 
-//log.info('inRTH {0} inETH{1} entryHour {2} entryMinute {3} time {4} entryStart {5} exitStart {6} dayStart {7} inSession {8}, inEntryWindow {9}', inRTH, inETH, dailyEntryWindowStartHour, dailyEntryWindowStartMinute, time, entryStart, exitStart, dayStart, inSession, inEntryWindow)
+if debugTime
+    log.info('inRTH {0} inETH{1} entryHour {2} entryMinute {3} time {4} entryStart {5} exitStart {6} dayStart {7} inSession {8}, inEntryWindow {9}', inRTH, inETH, dailyEntryWindowStartHour, dailyEntryWindowStartMinute, time, entryStart, exitStart, dayStart, inSession, inEntryWindow)
 // force daily exit flags/values, true if in range and enabled, false if outside exit time window, or false if disabled
 // bool inDailyRange = inSession and time >= dailyEntryStartTime and time_close <= dailyExitStartTime
 shortEnabled = false
@@ -2044,7 +2046,7 @@ if (canExit and inTestingRange and tradeActive and sessionOK) or mustExit
     if mustExit
         log.info('EOD closure triggered')
     if enableAlerts
-        alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + str.tostring(syminfo.ticker) + '",\n"action": "exit",\n"orderType": "stop_limit",\n"limitPrice": '+ str.tostring(gapClose) + ',\n"stopPrice": ' + str.tostring(exitLimitPrice) + '\n}'
+        alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + str.tostring(syminfo.ticker) + '",\n"action": "exit",\n"orderType": "stop_limit",\n"limitPrice": '+ str.tostring(exitLimitPrice) + ',\n"stopPrice": ' + str.tostring(gapClose) + '\n}'
         alertTitle := str.tostring(syminfo.ticker) + 'SELL triggered'
         if debug
             log.info('{0} : \n : {1}', scriptName, alertMessage)
