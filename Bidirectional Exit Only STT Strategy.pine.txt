@@ -1,10 +1,10 @@
 //@version=6
-// MJ 10-Jan-2026
+// MJ 12-Jan-2026
 strategy('STT ExitOnly Trade Plan Directional', overlay=true, initial_capital=1000, default_qty_type=strategy.fixed, default_qty_value=200, process_orders_on_close=true, pyramiding=0)
 import TradingView/ta/11
 
 // Setup the ability to have a label with the name of the script on the chart and use it in logging/debug statements
-scriptName = input.string('STT Trade Directional Strategy', 'Script Title')
+scriptName = input.string('STT ExitOnly Trade Directional Strategy', 'Script Title')
 showLabel = input.bool(false, "Show label on chart?")
 
 if showLabel
@@ -582,7 +582,12 @@ inETH = not na(time(timeframe.period, "0700-2000"))
 // allow override via input of the trading hours
 sessionOK = allowETH ? inETH : inRTH
 // use the override window (include extended hours ETH) or the restricted market hours (RTH) - limited by the entry start/exit enforced time
-inEntryWindow = (sessionOK and time >= entryStart and time_close < exitStart)
+
+// inEntryWindow = (sessionOK and time >= entryStart and time_close < exitStart)
+//inEntryWindow = (sessionOK and time >= dailyEntryStartTime and time_close < dailyExitStartTime)
+inEntryWindow = not na(time(timeframe.period, entrySessionStr))
+
+//log.info('inRTH {0} inETH{1} entryHour {2} entryMinute {3} time {4} entryStart {5} exitStart {6} dayStart {7} inSession {8}, inEntryWindow {9}', inRTH, inETH, dailyEntryWindowStartHour, dailyEntryWindowStartMinute, time, entryStart, exitStart, dayStart, inSession, inEntryWindow)
 // force daily exit flags/values, true if in range and enabled, false if outside exit time window, or false if disabled
 // bool inDailyRange = inSession and time >= dailyEntryStartTime and time_close <= dailyExitStartTime
 shortEnabled = false
@@ -1941,13 +1946,13 @@ if canEnter and not inExitOnlyWindowPeriod
                     // include stop/profit targets in the traderpost json
                     alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + syminfo.ticker + '",\n"action": "buy",\n "quantityType": "dollar_amount",\n "quantity": ' + str.tostring(tpQuantity)
                     alertMessage := alertMessage + ',\n "no_add": true,\n "takeProfit":{\n "percent": ' + str.tostring(tpTp) + '\n },\n "stopLoss":{\n "type": "stop",\n "percent": '
-                    alertMessage := alertMessage + str.tostring(tpSl) + '},\n"orderType": "stop_limit",\n"limitPrice": '+ str.tostring(enterLimitPrice) + ',\n"stopPrice": ' + str.tostring(gapClose) + '\n}'
+                    alertMessage := alertMessage + str.tostring(tpSl) + '},\n"orderType": "stop_limit",\n"limitPrice": '+ str.tostring(gapClose) + ',\n"stopPrice": ' + str.tostring(enterLimitPrice) + '\n}'
                     if debug 
                         log.info('{0} : \n : {1}', scriptName, alertMessage)
                 else
                     // no stop/profit targets in the traderpost json
                     alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + syminfo.ticker + '",\n"action": "buy",\n "quantityType": "dollar_amount",\n "quantity": '
-                    alertMessage += str.tostring(tpQuantity) + ',\n "no_add": true,\n "orderType": "stop_limit",\n"limitPrice": '+ str.tostring(enterLimitPrice) + ',\n"stopPrice": ' + str.tostring(gapClose) + '\n}'
+                    alertMessage += str.tostring(tpQuantity) + ',\n "no_add": true,\n "orderType": "stop_limit",\n"limitPrice": '+ str.tostring(gapClose) + ',\n"stopPrice": ' + str.tostring(enterLimitPrice) + '\n}'
                     log.info('{0} : \n : {1}', scriptName, alertMessage)
                 if enableAlertsEnter and rtBarStatus
                     log.info('BUY alert trigger fired')
@@ -2039,7 +2044,7 @@ if (canExit and inTestingRange and tradeActive and sessionOK) or mustExit
     if mustExit
         log.info('EOD closure triggered')
     if enableAlerts
-        alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + str.tostring(syminfo.ticker) + '",\n"action": "exit",\n"orderType": "stop_limit",\n"limitPrice": '+ str.tostring(exitLimitPrice) + ',\n"stopPrice": ' + str.tostring(gapClose) + '\n}'
+        alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + str.tostring(syminfo.ticker) + '",\n"action": "exit",\n"orderType": "stop_limit",\n"limitPrice": '+ str.tostring(gapClose) + ',\n"stopPrice": ' + str.tostring(exitLimitPrice) + '\n}'
         alertTitle := str.tostring(syminfo.ticker) + 'SELL triggered'
         if debug
             log.info('{0} : \n : {1}', scriptName, alertMessage)
