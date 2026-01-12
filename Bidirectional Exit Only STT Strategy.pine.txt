@@ -591,7 +591,7 @@ inSession = (time >= entryStart) and (time < exitStart)
 barOpen = time
 barClose = time + timeframe.in_seconds() * 1000
 
-inExitOnlyWindowPeriod = (time_close>= exitStart) and (time_close <= exitEnd)
+inExitOnlyWindowPeriod = (barClose > exitStart) and (barOpen < exitEnd)
 
 // allow override via input of the trading hours
 sessionOK = timeframe.isintraday and (allowETH ? inETH : inRTH)
@@ -2025,7 +2025,7 @@ if debugBear
     log.info(' Close = ' + str.tostring(ePrice))
 
 
-safetyClose = (ta.change(time("D")) != 0) and tradeActive and closeDaily
+safetyClose = isNewDay and tradeActive and closeDaily
 
 // log.info('mustExit p2 {0}, inTestingRange {1}, canExit : {2}', mustExit, inTestingRange, canExit)
 if (canExit and inTestingRange and tradeActive and sessionOK) or mustExit
