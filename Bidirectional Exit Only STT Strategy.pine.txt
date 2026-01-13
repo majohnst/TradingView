@@ -1418,11 +1418,14 @@ getBullEnabled(LongEntryInputs bullEntryConf, float curPrice, vwapConfigInfo vwa
 
 
 getEndOfDayExit() =>
-    eodExitWindow = (barOpen < exitEnd) and (barClose > exitStart)  // overlap check
+    barOpenEod = time
+    barCloseEod = time + timeframe.in_seconds() * 1000
+    eodExitWindow = (barOpenEod < exitEnd) and (barCloseEod > exitStart)  // overlap check
     newDay = ta.change(timestamp(syminfo.timezone, exYear, exMonth, exDay, 0, 0)) != 0
     safetyClose = newDay and tradeActive and closeDaily
     eodResult = false
-    inExitAlertWindow = inExitOnlyWindowPeriod and tradeActive and closeDaily and not eodExitFiredToday
+    inExitOnlyWindowPeriodEod = (barClose > exitStart) and (barOpen < exitEnd)
+    inExitAlertWindow = inExitOnlyWindowPeriodEod and tradeActive and closeDaily and not eodExitFiredToday
     // sessionOK and not eodExitFiredToday and time >= exitStart
     if not eodExitFiredToday and (inExitAlertWindow or safetyClose)
         CPL.signals.eodExitSignal := true
