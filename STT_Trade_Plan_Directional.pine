@@ -1,5 +1,5 @@
 //@version=6
-// MJ 08-Jan-2026
+// MJ 12-Jan-2026
 strategy('STT Trade Plan Directional', overlay=true, initial_capital=1000, default_qty_type=strategy.fixed, default_qty_value=200, process_orders_on_close=true, pyramiding=0)
 import TradingView/ta/11
 
@@ -51,44 +51,44 @@ enum TsType
 // ============================================================================
 
 //Reguired Indications
-primaryEntryType = input.string('Price', 'Entry Type', ['Price','Breakout','TMA-Crossing', 'VWAP-Crossing', 'All', 'Any'], group = 'Trade Entry Triggers', confirm=true, display=display.data_window)
+primaryEntryType = input.string('TMA-Crossing', 'Entry Type', ['Price','Breakout','TMA-Crossing', 'VWAP-Crossing', 'All', 'Any'], group = 'Trade Entry Triggers', confirm=true, display=display.data_window)
 //additionalEntryTypeLogic = input.string('or', 'Entry Type Addition Logical Method', ['and','or'], group = 'Trade Entry Triggers', confirm=true, display=display.data_window)
 additionalEntryTypeLogic = input.string('or', 'Entry Type Addition Logical Method', ['and','or'], group = 'Trade Entry Triggers', confirm=true, display=display.data_window)
 mainTriggerPriceType = input.string('Close', 'Price Trigger Type', options = ['Close', 'Open', 'High', 'Low', 'Median', 'Typical', 'Weighted'], group = 'Trade Entry Triggers', display=display.data_window)
-bool oneSignalPerDay  = input.bool(true, "Limit Only One Trade Per Day", group = 'Trade Entry Triggers', confirm=true, display=display.data_window)
-bool closeDaily = input.bool(false, "Enable Daily Close", group = 'Trade Entry Triggers', tooltip='When enabled all trades will be exited at time selected.',confirm=true, display=display.data_window)
+bool oneSignalPerDay  = input.bool(false, "Limit Only One Trade Per Day", group = 'Trade Entry Triggers', confirm=true, display=display.data_window)
+bool closeDaily = input.bool(true, "Enable Daily Close", group = 'Trade Entry Triggers', tooltip='When enabled all trades will be exited at time selected.',confirm=true, display=display.data_window)
 tradeDirectionSelected = input.enum(TradeDirection.Long, title='Trade types allowed', group = 'Trade Entry Triggers', tooltip = 'Type of trades Long, Short or both that backtesting and alert will get triggered.')
 int dailyEntryWindowStartHour = input.int(8, title="Hour (ET) to begin allowing trade entry", minval = 4, maxval = 19, group = 'Trade Time Triggers')
 int dailyEntryWindowStartMinute = input.int(30, title="Minutes after Hour to begin allowing trade entry", minval = 0, step = 15, maxval = 45, group = 'Trade Time Triggers')
-int dailyExitWindowStartHour = input.int(3, title="Hour (ET) to force daily trade exits", minval = 3, maxval = 19, group = 'Trade Time Triggers')
-int dailyExitWindowStartMinute = input.int(45, title="Minutes after Hour to force trade exits", minval = 0, step = 15, maxval = 45, group = 'Trade Time Triggers')
+int dailyExitWindowStartHour = input.int(15, title="Hour (ET) to force daily trade exits", minval = 3, maxval = 19, group = 'Trade Time Triggers')
+int dailyExitWindowStartMinute = input.int(30, title="Minutes after Hour to force trade exits", minval = 0, step = 15, maxval = 45, group = 'Trade Time Triggers')
 int exitBufferMinutes = input.int(15, title="Force Exit Buffer Minutes", minval = 15, maxval = 59, step=5, group = 'Trade Time Triggers')
-bool allowETH = input.bool(false, title="Allow Trading Alerts in Extended Hours", group = 'Trade Time Triggers')
+bool allowETH = input.bool(true, title="Allow Trading Alerts in Extended Hours", group = 'Trade Time Triggers')
 // SuperNova LowFloat Breakout Settings
 int triggerHour   = input.int(9, "Trigger Entry Enable Hour (ET)", group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
 int triggerMinute = input.int(45, "Trigger Entry Enable Minute", group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
 bool usePreMarketHigh = input.bool(false, "Include Pre-Market High", group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
-float floatSize         = input.float(3.0, "Max Float Size (M)", step=0.1, group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
-float volumeMultiplier = input.float(5.0, "Volume Multiplier", step=0.1, group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
-float percentGain      = input.float(50.0, "Min Percent Gain (%)", step=0.1, group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
+float floatSize         = input.float(20.0, "Max Float Size (M)", step=0.1, group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
+float volumeMultiplier = input.float(1.0, "Volume Multiplier", step=0.1, group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
+float percentGain      = input.float(25.0, "Min Percent Gain (%)", step=0.1, group = 'Breakout Trigger Settings', confirm=true, display=display.data_window)
 
 //TMA, VWAP, and other inclusion conditional settings
-additionalEntryType = input.string('None', 'Trade Entry Additional Type', ['None','Breakout','TMA-Crossing', 'VWAP-Crossing'], group = 'Trade Entry Triggers', confirm=true, display=display.data_window)
-tmaEntry_required = input.bool(false, title="Entry Requires TMA bullish state", group = "Trade Additional Triggers", tooltip='Overrides the slection list triggers, requiring TMA bullish state to also be true for entry.', display=display.data_window)
+additionalEntryType = input.string('Breakout', 'Trade Entry Additional Type', ['None','Breakout','TMA-Crossing', 'VWAP-Crossing'], group = 'Trade Entry Triggers', confirm=true, display=display.data_window)
+tmaEntry_required = input.bool(true, title="Entry Requires TMA bullish state", group = "Trade Additional Triggers", tooltip='Overrides the slection list triggers, requiring TMA bullish state to also be true for entry.', display=display.data_window)
 vwapEntryRequired = input.bool(false, title="Entry Requires Price Above VWAP", group = "Trade Additional Triggers", tooltip='Overrides the slection list triggers, requiring Price above VWAP to also be true for entry.', display=display.data_window)
 vwapExitRequired = input.bool(false, title="Exit Requires Price Below VWAP", group = "Trade Additional Triggers", tooltip='Overrides the slection list triggers, requiring Price below VWAP to also be true for exit.', display=display.data_window)
-tmaExitRequired = input.bool(false, title="Exit Requires TMA bearish state", group = "Trade Additional Triggers", tooltip='Overrides the slection list triggers, requiring TMA bearish state to also be true for exit.', display=display.data_window)
+tmaExitRequired = input.bool(true, title="Exit Requires TMA bearish state", group = "Trade Additional Triggers", tooltip='Overrides the slection list triggers, requiring TMA bearish state to also be true for exit.', display=display.data_window)
 manualPriceOnly = input.bool(false, title="Use Price Only (disables all others)", group = "Trade Additional Triggers", tooltip='Overrides the slection list triggers, requiring Manual Entry Price values for Entry, StopLoss, and Take Profit, disabling all other conditions.', display=display.data_window)
 tmaCrossingType = input.enum(TmaTriggerType.Crossing, title='TMA trigger type', group='Trade Additional Triggers')
 // Stop related settings
 primaryStopLossType = input.string('Range-Based', 'Primary Stop Type', ['Range-Based','Trailing-Stop','Fixed-Price','TMA-Crossing','Any'], group = 'Trade StopLoss Triggers', confirm=true)
 additionalStopLossTypeLogic = input.string('or', 'Stop Type Addition Logical Method', ['and','or'], group = 'Trade StopLoss Triggers', confirm=true, display=display.data_window)
-additionalStopLossType = input.string('None', 'Additional Stop Type', ['Range-Based','Trailing-Stop','Fixed-Price','None' ], group = 'Trade StopLoss Triggers', confirm=true, display=display.data_window)
+additionalStopLossType = input.string('TMA-Crossing', 'Additional Stop Type', ['Range-Based','Trailing-Stop','Fixed-Price','TMA-Crossing','None' ], group = 'Trade StopLoss Triggers', confirm=true, display=display.data_window)
 primaryTakeProfitType = input.string('Range-Based', 'Primary Take Profit Type', ['Range-Based','Trailing-StopProfit','Fixed-Price','TMA-Crossing', 'Any'], group = 'Trade TakeProfit Triggers', confirm=true, display=display.data_window)
 // The only possible states are or for entry, tma crossing is a bool flag (tmaExitRequired) that can be enabled earlier along with vwap (vwapExitRequired)
 //additionalTakeProfitTypeLogic = input.string('or', 'TakeProfit Type Addition Logical Method', ['and','or'], group = 'Trade TakeProfit Triggers', confirm=true, display=display.data_window)
 additionalTakeProfitTypeLogic = 'or'
-additionalTakeProfitType = input.string('None', 'Additional Take Profit Type', ['Range-Based','Trailing-StopProfit','Fixed-Price','TMA-Crossing','None'], group = 'Trade TakeProfit Triggers', confirm=true, display=display.data_window)
+additionalTakeProfitType = input.string('TMA-Crossing', 'Additional Take Profit Type', ['Range-Based','Trailing-StopProfit','Fixed-Price','TMA-Crossing','None'], group = 'Trade TakeProfit Triggers', confirm=true, display=display.data_window)
 tpAmount = input.float(0.07, 'Take Profit $1 Range Start ', step = 0.01, minval = 0.0, group = "Trade TakeProfit Triggers", confirm=false, tooltip='Initial range based take profit value - Amount above entry price at $1. will scale out for higher prices.', display=display.data_window)
 
 // Trailing Stop Settings
@@ -104,9 +104,9 @@ priceAdjust = input.bool(true, "Limit to under $1000 close.", 'Assumes any close
 // Manual related settings
 manualEntryPrice = input.float(0.01, 'Manual Entry Price', minval = 0.01, step = 0.01, group = "Manual Entry Conditions")
 manualExitStopPrice = input.float(0.08, 'Absolute StopLoss Exit Below Entry Price Amount', minval = 0.01, step = 0.01, group = "Manual Entry Conditions", display=display.data_window)
-manualExitProfitPrice = input.float(0.99, 'Absolute Take Profit Above Entry Amount', minval = 0.05, step = 0.01, group = "Manual Entry Conditions", display=display.data_window)
-manualExitStopOverride = input.bool(true, title="Use Exit StopLoss Below Price.", group = "Manual Entry Conditions")
-manualExitProfitOverride = input.bool(true, title="Take profit at specific amount above price.", group = "Manual Entry Conditions")
+manualExitProfitPrice = input.float(1.99, 'Absolute Take Profit Above Entry Amount', minval = 0.05, step = 0.01, group = "Manual Entry Conditions", display=display.data_window)
+manualExitStopOverride = input.bool(false, title="Use Exit StopLoss Below Price.", group = "Manual Entry Conditions")
+manualExitProfitOverride = input.bool(false, title="Take profit at specific amount above price.", group = "Manual Entry Conditions")
 
 // VWAP Settings
 vwapStdDev = input.int(55, 'Deviation Lookback Length', minval = 1, group = "VWAP Settings", display=display.data_window)
@@ -131,7 +131,6 @@ debugBull = input.bool(false, title='Deep Bull Debug', group = 'Alert Settings',
 debugBear = input.bool(false, title='Deep Bear Debug', group = 'Alert Settings', tooltip='Enables extra logging to show bear related variables.', display=display.data_window)
 debugSignals = input.bool(false, title='Deep Signal Debug', group = 'Alert Settings', tooltip='Enables extra logging to show signal related variables.', display=display.data_window)
 debugPrice = input.bool(false, title='Deep Price Action Debug', group = 'Alert Settings', tooltip='Enables extra logging to show bearprices, stops, and profits related variables.', display=display.data_window)
-debugTime = input.bool(false, title='Time Info Debug', group = 'Alert Settings', tooltip='Enables extra logging to show time variables.', display=display.data_window)
 
 debugInterval = input.string('5', options=['1','2','5','10', '15', '20', '30', '60', '120', '240', '480', '1440'], title='Debug Interval', group='Alert Settings', tooltip='For debugging that hits every tick, only show it the number of minutes apart.')
 
@@ -542,9 +541,9 @@ takeProfit_inputs := manualPriceOnly ? TakeProfitInputs.new('Fixed-Price', 'and'
 ShortStopInputs exitInputsShort = makeShortStopInputs(tmaCrossingType, rangeBased,shortBasedInit,tsAmount, tsMinProfit, tsAmount, tsMinProfitEnabled, trailingStopMinProfit, exitConfShort)
 ExitInputs exitInputs = ExitInputs.new(stopLoss_inputs, takeProfit_inputs, exitInputsShort)
 var breakoutConfig breakoutConf = makeBreakoutConfig(floatSize, volumeMultiplier, percentGain, triggerHour, triggerMinute, usePreMarketHigh)
+var bool eodExitFiredToday  = false
+var dailyLimitReached       = false
 
-// exitTime = timestamp(syminfo.timezone, year, month, dayofmonth, dailyExitWindowStartHour, dailyExitWindowStartMinute)
-// entryTime = timestamp(syminfo.timezone, year, month, dayofmonth, dailyEntryWindowStartHour, dailyEntryWindowStartMinute)
 // ======== Session Helper Functions ===========
 pad2(x) =>
     x < 10 ? "0" + str.tostring(x) : str.tostring(x)
@@ -552,44 +551,58 @@ pad2(x) =>
 f_timeToday(dayST, h , m) =>
     dayST + (h * 60 + m) * 60 * 1000
 
-dayStart = time("D")
-bool isNewDay = ta.change(time("D")) != 0
-var bool eodExitFiredToday  = false
-var dailyLimitReached       = false
+exYear  = year(time, syminfo.timezone)
+exMonth = month(time, syminfo.timezone)
+exDay   = dayofmonth(time, syminfo.timezone)
+exHour   = hour(time, syminfo.timezone)
+exMinute = minute(time, syminfo.timezone)
+dayStart = timestamp(syminfo.timezone, exYear, exMonth, exDay, 0, 0)
+
+isNewDay = ta.change(timestamp(syminfo.timezone, exYear, exMonth, exDay, 0, 0)) != 0
+
 // Daily reset
 if isNewDay
     breakoutConf := makeBreakoutConfig(floatSize, volumeMultiplier, percentGain, triggerHour, triggerMinute, usePreMarketHigh)
     dailyLimitReached := false
     eodExitFiredToday := false
 
-dailyExitStartTime = dayStart + (dailyExitWindowStartHour * 60 + dailyExitWindowStartMinute) * 60 * 1000
-dailyEntryStartTime = dayStart + (dailyEntryWindowStartHour * 60 + dailyEntryWindowStartMinute) * 60 * 1000
-//entrySessionStr = str.format("{0:02d}{1:02d}-{2:02d}{3:02d}", dailyEntryWindowStartHour, dailyEntryWindowStartMinute, dailyExitWindowStartHour, dailyExitWindowStartMinute)
-entrySessionStr = pad2(dailyEntryWindowStartHour) + pad2(dailyEntryWindowStartMinute) + "-" + pad2(dailyExitWindowStartHour)  + pad2(dailyExitWindowStartMinute)
-inSession = not na(time(timeframe.period, entrySessionStr))
-sessionEnd = allowETH ? "2000" : "1600"
+// dailyExitStartTime = dayStart + (dailyExitWindowStartHour * 60 + dailyExitWindowStartMinute) * 60 * 1000
+// dailyEntryStartTime = dayStart + (dailyEntryWindowStartHour * 60 + dailyEntryWindowStartMinute) * 60 * 1000
+// entrySessionStr = pad2(dailyEntryWindowStartHour) + pad2(dailyEntryWindowStartMinute) + "-" + pad2(dailyExitWindowStartHour)  + pad2(dailyExitWindowStartMinute)
+
+sessionEnd = allowETH ? "20" : "16"
 exitRangeStr = pad2(dailyExitWindowStartHour) + pad2(dailyExitWindowStartMinute) + "-" + sessionEnd
-inExitOnlyWindowPeriod = not na(time(timeframe.period, exitRangeStr))
-//bool inDailyRange = time >= dailyEntryStartTime and time_close <= dailyExitStartTime 
+dailyExitHour = allowETH ? 19 : 15
 
-// generate the times allowed for entries and exits
-entryStart = f_timeToday(dayStart, dailyEntryWindowStartHour, dailyEntryWindowStartMinute)
-exitStart = f_timeToday(dayStart, dailyExitWindowStartHour, dailyExitWindowStartMinute)
-exitEnd = f_timeToday(dayStart, dailyExitWindowStartHour, dailyExitWindowStartMinute + exitBufferMinutes)
-// exitStart + exitBufferMinutes * 60 * 1000
-// global variable setting trading allowed window
-inRTH = not na(time(timeframe.period, "0930-1600"))
-inETH = not na(time(timeframe.period, "0700-2000"))
+rthStart = timestamp(syminfo.timezone, exYear, exMonth, exDay, 9, 30)
+rthEnd   = timestamp(syminfo.timezone, exYear, exMonth, exDay, 16, 0)
+
+ethStart = timestamp(syminfo.timezone, exYear, exMonth, exDay, 7, 0)
+ethEnd   = timestamp(syminfo.timezone, exYear, exMonth, exDay, 20, 0)
+
+entryStart = timestamp(syminfo.timezone, exYear, exMonth, exDay, dailyEntryWindowStartHour, dailyEntryWindowStartMinute)
+exitStart = timestamp(syminfo.timezone, exYear, exMonth, exDay, dailyExitHour, 30)
+exitEnd = timestamp(syminfo.timezone, exYear, exMonth, exDay, dailyExitHour,59)
+inRTH = (time >= rthStart) and (time < rthEnd)
+inETH = (time >= ethStart) and (time < ethEnd)
+inSession = (time >= entryStart) and (time < exitStart)
+barOpen = time
+barClose = time + timeframe.in_seconds() * 1000
+
+//inExitOnlyWindowPeriod = (time < exitEnd) and (time > exitStart)
+inExitOnlyWindowPeriod = (barOpen > exitStart) and inSession and (barOpen < exitEnd)
 // allow override via input of the trading hours
-sessionOK = allowETH ? inETH : inRTH
+sessionOK = timeframe.isintraday and (allowETH ? inETH : inRTH)
 // use the override window (include extended hours ETH) or the restricted market hours (RTH) - limited by the entry start/exit enforced time
-
-// inEntryWindow = (sessionOK and time >= entryStart and time_close < exitStart)
-//inEntryWindow = (sessionOK and time >= dailyEntryStartTime and time_close < dailyExitStartTime)
-inEntryWindow = not na(time(timeframe.period, entrySessionStr))
-
-if debugTime
-    log.info('inRTH {0} inETH{1} entryHour {2} entryMinute {3} time {4} entryStart {5} exitStart {6} dayStart {7} inSession {8}, inEntryWindow {9}', inRTH, inETH, dailyEntryWindowStartHour, dailyEntryWindowStartMinute, time, entryStart, exitStart, dayStart, inSession, inEntryWindow)
+inEntryWindow = (sessionOK and time >= entryStart and time < exitStart)
+if barstate.islast
+    label.new(bar_index, high,
+        "Chart: " + str.tostring(hour) + ":" + str.tostring(minute) +
+        "\nExchange: " +
+        str.tostring(hour(time, syminfo.timezone)) + ":" +
+        str.tostring(minute(time, syminfo.timezone))
+    )
+// log.info('inRTH {0} inETH{1} entryHour {2} entryMinute {3} time {4} entryStart {5} exitStart {6} dayStart {7} inSession {8}, inEntryWindow {9}', inRTH, inETH, dailyEntryWindowStartHour, dailyEntryWindowStartMinute, time, entryStart, exitStart, dayStart, inSession, inEntryWindow)
 // force daily exit flags/values, true if in range and enabled, false if outside exit time window, or false if disabled
 // bool inDailyRange = inSession and time >= dailyEntryStartTime and time_close <= dailyExitStartTime
 shortEnabled = false
@@ -1403,17 +1416,19 @@ getBullEnabled(LongEntryInputs bullEntryConf, float curPrice, vwapConfigInfo vwa
 
 
 getEndOfDayExit() =>
-    safetyClose = (ta.change(time("D")) != 0) and tradeActive and closeDaily
+    barOpenEod = time
+    barCloseEod = time + timeframe.in_seconds() * 1000
+    eodExitWindow = (barOpenEod < exitEnd) and (barCloseEod > exitStart)  // overlap check
+    newDay = ta.change(timestamp(syminfo.timezone, exYear, exMonth, exDay, 0, 0)) != 0
+    safetyClose = newDay and tradeActive and closeDaily
     eodResult = false
-    inExitAlertWindow = inExitOnlyWindowPeriod and tradeActive and closeDaily and not eodExitFiredToday
+    inExitOnlyWindowPeriodEod = (barClose > exitStart) and (barOpen < exitEnd)
+    inExitAlertWindow = inExitOnlyWindowPeriodEod and tradeActive and closeDaily and not eodExitFiredToday
     // sessionOK and not eodExitFiredToday and time >= exitStart
-    eodResult := switch eodExitFiredToday
-        false =>
-            CPL.signals.eodExitSignal := true
-            CPS.signals.eodExitSignal := true
-            inExitAlertWindow or safetyClose 
-        true => 
-            false
+    if not eodExitFiredToday and (inExitAlertWindow or safetyClose)
+        CPL.signals.eodExitSignal := true
+        CPS.signals.eodExitSignal := true
+        eodResult := true
     eodResult
 getTMAExitSignal(
     ExitInputs exitConf,
@@ -1886,8 +1901,17 @@ if debugSignals
     log.info('INLINE-03 canEnter : {0}, bullSignal : {1}', canEnter, bullSignal)
 // Create the validation flag for exiting, default to false
 canExit  = tradeActive
-dailyExitInRange = time >= exitStart and closeDaily and tradeActive and not eodExitFiredToday
-mustExit = getEndOfDayExit() and tradeActive and closeDaily
+dailyExitInRange = time_close >= exitStart and closeDaily and tradeActive and not eodExitFiredToday
+
+safetyClose = isNewDay and tradeActive and closeDaily
+eodResult = false
+inExitAlertWindow = inExitOnlyWindowPeriod and tradeActive and closeDaily and not eodExitFiredToday
+mustExit = false
+if not eodExitFiredToday and (inExitAlertWindow or safetyClose)
+    CPL.signals.eodExitSignal := true
+    CPS.signals.eodExitSignal := true
+    eodExitFiredToday := true   // 🔴 MUST be here
+    mustExit := true
 
 
 // Check required indicators state and update based on condition
@@ -1923,11 +1947,10 @@ if canEnter and not inExitOnlyWindowPeriod
     if barstate.isrealtime and not barstate.isrealtime[1]
         log.warning("🔴 canEnter ENTERED REALTIME MODE @ {0}", time)
     ePrice := getPrice(mainTriggerPriceType)
-    eodExitFiredToday := false
     posDir := (CPL.signals.bullSignal ? PositionDirection.LONG : (CPS.signals.bearEntrySignal ? PositionDirection.SHORT : PositionDirection.NONE ))
     float gapClose = ePrice
-    gapClose := math.round((ePrice + orderEnterGap), 2)
-    enterLimitPrice = math.floor(ePrice * 100.0) / 100.0
+    enterLimitPrice = math.ceil(ePrice * 100.0) / 100.0
+    gapClose := math.round((enterLimitPrice + orderEnterGap), 2)
     if enableAlerts   
         if debugBull
             log.info('canEnter triggered - Entered if block')
@@ -2011,7 +2034,6 @@ if debugBear
     log.info(' Close = ' + str.tostring(ePrice))
 
 
-safetyClose = (ta.change(time("D")) != 0) and tradeActive and closeDaily
 
 // log.info('mustExit p2 {0}, inTestingRange {1}, canExit : {2}', mustExit, inTestingRange, canExit)
 if (canExit and inTestingRange and tradeActive and sessionOK) or mustExit
@@ -2020,8 +2042,9 @@ if (canExit and inTestingRange and tradeActive and sessionOK) or mustExit
     log.info('entryStart {0} exitStart {1} inSession {2} exitEnd {3}', entryStart, exitStart, inSession, exitEnd)
     if debugDeep
         log.info('Entered exit : mustExit : {0}', mustExit)
-    float gapClose = math.round((ePrice - orderExitGap), 2)
-    float exitLimitPrice = math.floor(ePrice * 100.0) / 100.0
+    float exitLimitPrice = math.floor(ePrice * 100.0) / 100.0    
+    float gapClose = math.round((exitLimitPrice - orderExitGap), 2)
+    
     if debugDeep or debugBear
         log.info('Entered canExit at {0}', ePrice)
         log.info('canExit {0}, inTestingRange {1}, mustExit : {2}', canExit, inTestingRange, mustExit)
@@ -2045,8 +2068,9 @@ if (canExit and inTestingRange and tradeActive and sessionOK) or mustExit
                 log.info('Exit reason na, posDir set to NONE')
     if mustExit
         log.info('EOD closure triggered')
+        eodExitFiredToday := true
     if enableAlerts
-        alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + str.tostring(syminfo.ticker) + '",\n"action": "exit",\n"orderType": "stop_limit",\n"limitPrice": '+ str.tostring(exitLimitPrice) + ',\n"stopPrice": ' + str.tostring(gapClose) + '\n}'
+        alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + str.tostring(syminfo.ticker) + '",\n"action": "exit",\n"orderType": "stop_limit",\n"limitPrice": '+ str.tostring(gapClose) + ',\n"stopPrice": ' + str.tostring(exitLimitPrice) + '\n}'
         alertTitle := str.tostring(syminfo.ticker) + 'SELL triggered'
         if debug
             log.info('{0} : \n : {1}', scriptName, alertMessage)

@@ -558,9 +558,7 @@ exHour   = hour(time, syminfo.timezone)
 exMinute = minute(time, syminfo.timezone)
 dayStart = timestamp(syminfo.timezone, exYear, exMonth, exDay, 0, 0)
 
-bool isNewDay = ta.change(dayStart) != 0
-// dayStart = time("D")
-// bool isNewDay = ta.change(time("D")) != 0
+isNewDay = ta.change(timestamp(syminfo.timezone, exYear, exMonth, exDay, 0, 0)) != 0
 
 // Daily reset
 if isNewDay
@@ -583,7 +581,7 @@ ethStart = timestamp(syminfo.timezone, exYear, exMonth, exDay, 7, 0)
 ethEnd   = timestamp(syminfo.timezone, exYear, exMonth, exDay, 20, 0)
 
 entryStart = timestamp(syminfo.timezone, exYear, exMonth, exDay, dailyEntryWindowStartHour, dailyEntryWindowStartMinute)
-exitStart = timestamp(syminfo.timezone, exYear, exMonth, exDay, dailyExitHour, 60 - exitBufferMinutes)
+exitStart = timestamp(syminfo.timezone, exYear, exMonth, exDay, dailyExitHour, 30)
 exitEnd = timestamp(syminfo.timezone, exYear, exMonth, exDay, dailyExitHour,59)
 inRTH = (time >= rthStart) and (time < rthEnd)
 inETH = (time >= ethStart) and (time < ethEnd)
@@ -591,8 +589,8 @@ inSession = (time >= entryStart) and (time < exitStart)
 barOpen = time
 barClose = time + timeframe.in_seconds() * 1000
 
-inExitOnlyWindowPeriod = (barClose > exitStart) and (barOpen < exitEnd)
-
+//inExitOnlyWindowPeriod = (time < exitEnd) and (time > exitStart)
+inExitOnlyWindowPeriod = (barOpen > exitStart) and inSession and (barOpen < exitEnd)
 // allow override via input of the trading hours
 sessionOK = timeframe.isintraday and (allowETH ? inETH : inRTH)
 // use the override window (include extended hours ETH) or the restricted market hours (RTH) - limited by the entry start/exit enforced time
@@ -604,7 +602,7 @@ if barstate.islast
         str.tostring(hour(time, syminfo.timezone)) + ":" +
         str.tostring(minute(time, syminfo.timezone))
     )
-log.info('inRTH {0} inETH{1} entryHour {2} entryMinute {3} time {4} entryStart {5} exitStart {6} dayStart {7} inSession {8}, inEntryWindow {9}', inRTH, inETH, dailyEntryWindowStartHour, dailyEntryWindowStartMinute, time, entryStart, exitStart, dayStart, inSession, inEntryWindow)
+// log.info('inRTH {0} inETH{1} entryHour {2} entryMinute {3} time {4} entryStart {5} exitStart {6} dayStart {7} inSession {8}, inEntryWindow {9}', inRTH, inETH, dailyEntryWindowStartHour, dailyEntryWindowStartMinute, time, entryStart, exitStart, dayStart, inSession, inEntryWindow)
 // force daily exit flags/values, true if in range and enabled, false if outside exit time window, or false if disabled
 // bool inDailyRange = inSession and time >= dailyEntryStartTime and time_close <= dailyExitStartTime
 shortEnabled = false
@@ -1904,7 +1902,16 @@ if debugSignals
 // Create the validation flag for exiting, default to false
 canExit  = tradeActive
 dailyExitInRange = time_close >= exitStart and closeDaily and tradeActive and not eodExitFiredToday
-mustExit = getEndOfDayExit() and tradeActive and closeDaily
+
+safetyClose = isNewDay and tradeActive and closeDaily
+eodResult = false
+inExitAlertWindow = inExitOnlyWindowPeriod and tradeActive and closeDaily and not eodExitFiredToday
+mustExit = false
+if not eodExitFiredToday and (inExitAlertWindow or safetyClose)
+    CPL.signals.eodExitSignal := true
+    CPS.signals.eodExitSignal := true
+    eodExitFiredToday := true   // 🔴 MUST be here
+    mustExit := true
 
 
 // Check required indicators state and update based on condition
@@ -1940,7 +1947,6 @@ if canEnter and not inExitOnlyWindowPeriod
     if barstate.isrealtime and not barstate.isrealtime[1]
         log.warning("🔴 canEnter ENTERED REALTIME MODE @ {0}", time)
     ePrice := getPrice(mainTriggerPriceType)
-    eodExitFiredToday := false
     posDir := (CPL.signals.bullSignal ? PositionDirection.LONG : (CPS.signals.bearEntrySignal ? PositionDirection.SHORT : PositionDirection.NONE ))
     float gapClose = ePrice
     enterLimitPrice = math.ceil(ePrice * 100.0) / 100.0
@@ -2028,7 +2034,6 @@ if debugBear
     log.info(' Close = ' + str.tostring(ePrice))
 
 
-safetyClose = isNewDay and tradeActive and closeDaily
 
 // log.info('mustExit p2 {0}, inTestingRange {1}, canExit : {2}', mustExit, inTestingRange, canExit)
 if (canExit and inTestingRange and tradeActive and sessionOK) or mustExit
