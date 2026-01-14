@@ -144,7 +144,7 @@ tpSubscription = input.bool(false, title='Include TP Subscription Name', group =
 tpBroker = input.enum(TpBroker.Robinhood, title="TP Subscription Name",group = 'TradePost JSON Values')
 
 
-tpQuantity = input.float(50.00, 'Dollars Per Trade', minval = 20.00, step = 1.0, group = 'TradePost JSON Values', display=display.data_window)
+tpQuantity = input.float(90.00, 'Dollars Per Trade', minval = 20.00, step = 1.0, group = 'TradePost JSON Values', display=display.data_window)
 tpSetTargets = input.bool(defval=false, title='Include Stops', group = 'TradePost JSON Values', display=display.data_window)
 tpTp = input.float(25, 'Take Profit Percent', minval = 1.00, step = 1.0, group = 'TradePost JSON Values', display=display.data_window)
 tpSl = input.float(10, 'Stop Loss Percent', minval = 1.00, step = 1.0, group = 'TradePost JSON Values', display=display.data_window)
@@ -575,14 +575,14 @@ exitRangeStr = pad2(dailyExitWindowStartHour) + pad2(dailyExitWindowStartMinute)
 dailyExitHour = allowETH ? 19 : 15
 
 rthStart = timestamp(syminfo.timezone, exYear, exMonth, exDay, 9, 30)
-rthEnd   = timestamp(syminfo.timezone, exYear, exMonth, exDay, 16, 0)
+rthEnd   = timestamp(syminfo.timezone, exYear, exMonth, exDay, 15, 30)
 
 ethStart = timestamp(syminfo.timezone, exYear, exMonth, exDay, 7, 0)
-ethEnd   = timestamp(syminfo.timezone, exYear, exMonth, exDay, 20, 0)
+ethEnd   = timestamp(syminfo.timezone, exYear, exMonth, exDay, 19, 30)
 
 entryStart = timestamp(syminfo.timezone, exYear, exMonth, exDay, dailyEntryWindowStartHour, dailyEntryWindowStartMinute)
 exitStart = timestamp(syminfo.timezone, exYear, exMonth, exDay, dailyExitHour, 30)
-exitEnd = timestamp(syminfo.timezone, exYear, exMonth, exDay, dailyExitHour,59)
+exitEnd = timestamp(syminfo.timezone, exYear, exMonth, exDay, dailyExitHour + 1, 0)
 inRTH = (time >= rthStart) and (time < rthEnd)
 inETH = (time >= ethStart) and (time < ethEnd)
 inSession = (time >= entryStart) and (time < exitStart)
@@ -590,12 +590,12 @@ barOpen = time
 barClose = time + timeframe.in_seconds() * 1000
 
 //inExitOnlyWindowPeriod = (time < exitEnd) and (time > exitStart)
-inExitOnlyWindowPeriod = (barOpen > exitStart) and inSession and (barOpen < exitEnd)
+inExitOnlyWindowPeriod = (barOpen > exitStart) // and inSession // and (barOpen < exitEnd)
 // allow override via input of the trading hours
 sessionOK = timeframe.isintraday and (allowETH ? inETH : inRTH)
 // use the override window (include extended hours ETH) or the restricted market hours (RTH) - limited by the entry start/exit enforced time
 inEntryWindow = (sessionOK and time >= entryStart and time < exitStart)
-if barstate.islast
+if barstate.islast and debugDeep
     label.new(bar_index, high,
         "Chart: " + str.tostring(hour) + ":" + str.tostring(minute) +
         "\nExchange: " +
@@ -1949,7 +1949,7 @@ if canEnter and not inExitOnlyWindowPeriod
     ePrice := getPrice(mainTriggerPriceType)
     posDir := (CPL.signals.bullSignal ? PositionDirection.LONG : (CPS.signals.bearEntrySignal ? PositionDirection.SHORT : PositionDirection.NONE ))
     float gapClose = ePrice
-    enterLimitPrice = math.ceil(ePrice * 100.0) / 100.0
+    enterLimitPrice = (math.ceil((ePrice  + orderEnterGap) * 100.0) / 100.0)
     gapClose := math.round((enterLimitPrice + orderEnterGap), 2)
     if enableAlerts   
         if debugBull
@@ -1971,13 +1971,15 @@ if canEnter and not inExitOnlyWindowPeriod
                     // include stop/profit targets in the traderpost json
                     alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + syminfo.ticker + '",\n"action": "buy",\n "quantityType": "dollar_amount",\n "quantity": ' + str.tostring(tpQuantity)
                     alertMessage := alertMessage + ',\n "no_add": true,\n "takeProfit":{\n "percent": ' + str.tostring(tpTp) + '\n },\n "stopLoss":{\n "type": "stop",\n "percent": '
-                    alertMessage := alertMessage + str.tostring(tpSl) + '},\n"orderType": "stop_limit",\n"limitPrice": '+ str.tostring(gapClose) + ',\n"stopPrice": ' + str.tostring(enterLimitPrice) + '\n}'
+                    alertMessage := alertMessage + str.tostring(tpSl) + '},\n"orderType": "limit",\n"limitPrice": '+ str.tostring(enterLimitPrice) + '\n}'
+                    //alertMessage := alertMessage + str.tostring(tpSl) + '},\n"orderType": "stop_limit",\n"limitPrice": '+ str.tostring(gapClose) + ',\n"stopPrice": ' + str.tostring(enterLimitPrice) + '\n}'
                     if debug 
                         log.info('{0} : \n : {1}', scriptName, alertMessage)
                 else
                     // no stop/profit targets in the traderpost json
                     alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + syminfo.ticker + '",\n"action": "buy",\n "quantityType": "dollar_amount",\n "quantity": '
-                    alertMessage += str.tostring(tpQuantity) + ',\n "no_add": true,\n "orderType": "stop_limit",\n"limitPrice": '+ str.tostring(gapClose) + ',\n"stopPrice": ' + str.tostring(enterLimitPrice) + '\n}'
+                    alertMessage += str.tostring(tpQuantity) + ',\n "no_add": true,\n "orderType": "limit",\n"limitPrice": '+ str.tostring(enterLimitPrice) + '\n}'
+                    // alertMessage += str.tostring(tpQuantity) + ',\n "no_add": true,\n "orderType": "stop_limit",\n"limitPrice": '+ str.tostring(gapClose) + ',\n"stopPrice": ' + str.tostring(enterLimitPrice) + '\n}'
                     log.info('{0} : \n : {1}', scriptName, alertMessage)
                 if enableAlertsEnter and rtBarStatus
                     log.info('BUY alert trigger fired')
@@ -2042,9 +2044,8 @@ if (canExit and inTestingRange and tradeActive and sessionOK) or mustExit
     log.info('entryStart {0} exitStart {1} inSession {2} exitEnd {3}', entryStart, exitStart, inSession, exitEnd)
     if debugDeep
         log.info('Entered exit : mustExit : {0}', mustExit)
-    float exitLimitPrice = math.floor(ePrice * 100.0) / 100.0    
-    float gapClose = math.round((exitLimitPrice - orderExitGap), 2)
-    
+    float exitLimitPrice = (math.floor((ePrice - orderExitGap) * 100.0) / 100.0)   
+    float gapClose = math.round((exitLimitPrice - orderExitGap), 2)    
     if debugDeep or debugBear
         log.info('Entered canExit at {0}', ePrice)
         log.info('canExit {0}, inTestingRange {1}, mustExit : {2}', canExit, inTestingRange, mustExit)
@@ -2070,7 +2071,9 @@ if (canExit and inTestingRange and tradeActive and sessionOK) or mustExit
         log.info('EOD closure triggered')
         eodExitFiredToday := true
     if enableAlerts
-        alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + str.tostring(syminfo.ticker) + '",\n"action": "exit",\n"orderType": "stop_limit",\n"limitPrice": '+ str.tostring(gapClose) + ',\n"stopPrice": ' + str.tostring(exitLimitPrice) + '\n}'
+        alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + str.tostring(syminfo.ticker) + '",\n"action": "exit",\n"orderType": "limit",\n"limitPrice": '+ str.tostring(exitLimitPrice) + '\n}'
+        //alertMessage := '{\n' + str.tostring(tpSub) + '"ticker": "' + str.tostring(syminfo.ticker) + '",\n"action": "exit",\n"orderType": "stop_limit",\n"limitPrice": '+ str.tostring(gapClose) + ',\n"stopPrice": ' + str.tostring(exitLimitPrice) + '\n}'
+            
         alertTitle := str.tostring(syminfo.ticker) + 'SELL triggered'
         if debug
             log.info('{0} : \n : {1}', scriptName, alertMessage)
