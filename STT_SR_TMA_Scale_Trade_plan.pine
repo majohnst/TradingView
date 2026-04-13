@@ -1,10 +1,10 @@
 //@version=6
-// MJ 21-Jan-2026
-strategy('STT SR TMA Scale ExitOnly Plan', overlay=true, initial_capital=1000, default_qty_type=strategy.fixed, default_qty_value=200, process_orders_on_close=true, pyramiding=0)
+// MJ 15-Jan-2026
+strategy('STT SR TMA Scale Plan', overlay=true, initial_capital=1000, default_qty_type=strategy.fixed, default_qty_value=200, process_orders_on_close=true, pyramiding=0)
 import TradingView/ta/11
 
 // Setup the ability to have a label with the name of the script on the chart and use it in logging/debug statements
-scriptName = input.string('STT SR TMA ExitOnly Scale', 'Script Title')
+scriptName = input.string('STT SR TMA Scale', 'Script Title')
 showLabel = input.bool(false, "Show label on chart?")
 
 if showLabel
@@ -109,10 +109,10 @@ intStopType = tsType == '$' ? TsType.DOLLAR : TsType.PERCENT
 priceAdjust = input.bool(true, "Limit to under $1000 close.", 'Assumes any close/open/etc price must be less than 1000 or it needs to be scaled down.', display=display.data_window)
 // Manual related settings
 manualEntryPrice = input.float(0.01, 'Manual Entry Price', minval = 0.01, step = 0.01, group = "Manual Entry Conditions")
-manualExitStopPrice = input.float(0.12, 'Absolute StopLoss Exit Below Entry Price Amount', minval = 0.01, step = 0.01, group = "Manual Entry Conditions", display=display.data_window)
+manualExitStopPrice = input.float(0.08, 'Absolute StopLoss Exit Below Entry Price Amount', minval = 0.01, step = 0.01, group = "Manual Entry Conditions", display=display.data_window)
 manualExitProfitPrice = input.float(1.99, 'Absolute Take Profit Above Entry Amount', minval = 0.05, step = 0.01, group = "Manual Entry Conditions", display=display.data_window)
-manualExitStopOverride = input.bool(true, title="Use Exit StopLoss Below Price.", group = "Manual Entry Conditions")
-manualExitProfitOverride = input.bool(true, title="Take profit at specific amount above price.", group = "Manual Entry Conditions")
+manualExitStopOverride = input.bool(false, title="Use Exit StopLoss Below Price.", group = "Manual Entry Conditions")
+manualExitProfitOverride = input.bool(false, title="Take profit at specific amount above price.", group = "Manual Entry Conditions")
 
 // VWAP Settings
 vwapStdDev = input.int(55, 'Deviation Lookback Length', minval = 1, group = "VWAP Settings", display=display.data_window)
@@ -129,7 +129,7 @@ fastDeviations = input.float(3.4, 'Bands Multiplier', minval = 0.1, step = 0.1, 
 signalOffset = input.int(5, 'Signal Arrow Offset (pips)', minval = 0, group = 'Signal Settings', display=display.data_window)
 // Alert Settings
 enableAlerts = input.bool(true, 'Enable Alerts', group = 'Alert Settings', display=display.data_window)
-enableAlertsEnter = input.bool(false, 'Enable Buy Signal', group = 'Alert Settings', display=display.data_window)
+enableAlertsEnter = input.bool(true, 'Enable Buy Signal', group = 'Alert Settings', display=display.data_window)
 enableAlertsExit = input.bool(true, 'Enable Sell Signal', group = 'Alert Settings', display=display.data_window)
 debug = input.bool(true, title='Debug', group = 'Alert Settings', tooltip='Enables JSON info logging.', display=display.data_window)
 debugDeep = input.bool(false, title='Deep Debug', group = 'Alert Settings', tooltip='Enables extra logging to show variables.', display=display.data_window)
