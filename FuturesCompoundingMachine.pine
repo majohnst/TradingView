@@ -1,0 +1,1079 @@
+// ============================================================================
+//  Futures Compounding Machine
+//  Gann Swing Lanes signal engine with small-account compounding risk controls
+//  Pine Script v6
+//
+//  OVERVIEW:
+//    Same Gann swing signal logic as GannSwingLanes_TradersPost.pine, with
+//    additional risk/compounding controls for disciplined small-account growth.
+//    Designed primarily for MYM and MES.
+//
+//  COMPOUNDING CONTROLS:
+//    1. Max Daily Loss         — cumulative intraday loss halts all new entries
+//                               for the remainder of the day. Resets each morning.
+//    2. Max Consecutive Losses — N losses in a row halts trading for the day.
+//    3. Trade Profit Target    — dollar-based take-profit converted to a limit
+//                               price via the instrument tick value. Warning label
+//                               appears when the target falls below one tick.
+//    4. Compound Ratio         — win: target x ratio. Loss: target / ratio.
+//                               Grows winners over time, shrinks after losses.
+//                               Floor is always one tick.
+//
+//  RISK:REWARD GATE:
+//    Before each entry, the TP distance is compared against the stop distance
+//    (pivot to entry, or 1x ATR when no pivot stop is set). Entries are skipped
+//    when the R:R falls below the minimum threshold.
+//
+//  TIME-OF-DAY WINDOWS:
+//    Four CT time windows each have an enable toggle and their own compound ratio.
+//    Disable a window to block all entries during that period. The compound ratio
+//    applied on a trade's close is the one captured at entry time, so a trade
+//    entered in the morning keeps the morning ratio regardless of when it closes.
+//    The fallback ratio (GRP_COMP) is used when no window is active (off-hours).
+//
+//  DIFFERENCE FROM BASE STRATEGY:
+//    The base strategy exits on the next opposing swing signal (full swing run).
+//    This strategy exits at a fixed dollar TP limit — smaller, more consistent
+//    wins designed to compound a small account without large drawdowns.
+//
+//  INSTRUMENT AUTO-CONFIG:
+//    All 6 calibrated micro-futures configs are retained (MYM, MES, MNQ,
+//    M2K, MGC, MBT). MYM and MES are the primary focus instruments.
+//
+//  NOTE ON "BOTH" MODE REVERSAL TIMING:
+//    When a reversal fires (e.g., short closes and long opens on the same bar),
+//    compound/halt state updates one bar later due to Pine Script bar-close
+//    order sequencing. The TP limit self-corrects the following bar.
+// ============================================================================
+
+//@version=6
+strategy("Futures Compounding Machine",
+         overlay            = true,
+         default_qty_type   = strategy.fixed,
+         default_qty_value  = 1,
+         pyramiding         = 0,
+         calc_on_every_tick = false)
+
+// ── User-Defined Types ────────────────────────────────────────────────────────
+
+type SwingState
+    bool  lastWasUp = false
+    bool  lastWasDn = false
+    float upHigh    = na
+    int   upBar     = na
+    float downLow   = na
+    int   downBar   = na
+
+type PivotPoints
+    chart.point high = na
+    chart.point low  = na
+
+type InstrumentConfig
+    // ── Signal Filters ─────────────────────────────────
+    bool  pivotStop   = false               // Enable Pivot Stop
+    float swingSize   = 1.6                 // Min Swing Size (x ATR)
+    int   cooldown    = 3                   // Cooldown (bars)
+    int   emaLen      = 20                  // Trend EMA Length (reference — effEmaLen uses cfgEmaLen switch)
+    bool  breakeven   = false               // Enable Auto Breakeven
+    // ── Risk Management ────────────────────────────────
+    float pivotBuf    = 0.25               // Pivot Buffer (x ATR)
+    float beTrigger   = 2.0                // Breakeven Trigger (x ATR)
+    float beBuf       = 0.5                // Breakeven Buffer (x ATR)
+    bool  rrGate      = false              // Enable R:R Gate
+    float rrMinVal    = 1.5                // Min Reward:Risk Ratio
+    // ── Compounding Controls ───────────────────────────
+    bool  resetTp     = false              // Reset TP Target Each Day
+    float initTp      = 35.0              // Initial Trade Profit Target ($)
+    float maxDaily    = 35.0              // Max Daily Loss ($)
+    int   maxConsec   = 3                 // Max Consecutive Losses
+    float maxLoss     = 70.0              // Max Loss Per Trade ($)
+    float fallRatio   = 1.1               // Fallback Compound Ratio
+    // ── Time Windows ───────────────────────────────────
+    bool  w1En        = true              // Enable Morning 07-11 CT
+    float w1Ratio     = 1.15             // Morning Compound Ratio
+    bool  w2En        = false             // Enable Midday 11-13 CT
+    float w2Ratio     = 1.0              // Midday Compound Ratio
+    bool  w3En        = true              // Enable Afternoon 13-16 CT
+    float w3Ratio     = 1.05             // Afternoon Compound Ratio
+    bool  w4En        = false             // Enable Late Day 16-17 CT
+    float w4Ratio     = 1.0              // Late Day Compound Ratio
+    // ── Day Bias ───────────────────────────────────────
+    bool   useApex    = false             // Use Embedded Apex Trend Signal
+    string apexMode   = "Trend (Adaptive MA)"  // Apex Signal Mode
+    int    apexPeriod = 20               // Apex Lookback Period (reference — use cfgApexPeriod for ta.*)
+    string apexTf     = "D"              // Apex Signal Timeframe (reference — use cfgApexTf for request.*)
+    // ── Day Bias Control ───────────────────────────────
+    bool  neutralBias   = true            // Neutral Bias allows both directions (false = block all when neutral)
+    // ── Position Sizing ────────────────────────────────
+    bool  autoSize      = false           // Per-instrument sizing enable
+    float sizeUpEvery   = 50.0           // Add 1 contract per $X cumul profit (default conservative = MYM)
+    float sizeDownEvery = 50.0           // Remove 1 contract per $Y drawdown (default conservative = MYM)
+    int   sizeMax       = 3              // Max additional contracts (default conservative = MYM)
+
+// ── Per-Instrument Config ─────────────────────────────────────────────────────
+// Calibrated for 0700-1700 CT session (Oct 2025 - May 2026, 5-min bars).
+// Pattern: InstrumentConfig.new() uses UDT defaults (= fallback).
+//          Only fields that differ from the defaults are explicitly set.
+getConfig(string root) =>
+    InstrumentConfig cfg = InstrumentConfig.new()
+    if root == "MYM"
+        // Signal Filters
+        cfg.swingSize  := 2.1
+        cfg.cooldown   := 6
+        cfg.emaLen     := 17
+        // Risk Management
+        cfg.breakeven  := true
+        cfg.pivotBuf   := 0.35
+        cfg.beTrigger  := 1.7
+        cfg.beBuf      := 1.19
+        // Compounding
+        cfg.resetTp    := true
+        cfg.initTp     := 30.0
+        cfg.maxDaily   := 30.0
+        cfg.maxConsec  := 4
+        cfg.maxLoss    := 10.0
+        cfg.fallRatio  := 1.2
+        // Time Windows
+        cfg.w1Ratio    := 1.35
+        cfg.w2Ratio    := 1.25
+        cfg.w3Ratio    := 1.25
+        cfg.w4En       := true
+        cfg.w4Ratio    := 1.2
+        // Day Bias
+        cfg.useApex    := true
+        cfg.apexMode   := "Structure (BOS/CHoCH)"
+        cfg.apexPeriod := 9
+        cfg.apexTf     := "120"
+        // Position Sizing — validated Oct 2025–May 2026: $50/$50/max+3 (UDT defaults)
+        cfg.autoSize   := true
+    else if root == "MES"
+        // Signal Filters
+        cfg.swingSize  := 2.1
+        cfg.cooldown   := 4
+        cfg.emaLen     := 18
+        // Risk Management — breakeven intentionally OFF (BE stops kill TP compounding on MES)
+        cfg.rrGate     := true
+        // Compounding
+        cfg.resetTp    := true
+        cfg.maxConsec  := 2
+        cfg.fallRatio  := 1.2
+        // Day Bias — Apex ON, neutral blocks entries (don't trade when direction unclear)
+        cfg.useApex    := true
+        cfg.apexMode   := "Structure (BOS/CHoCH)"
+        cfg.apexPeriod := 8
+        cfg.neutralBias := false
+        // apexTf stays "D" (UDT default)
+        // Position Sizing — validated Oct 2025–May 2026: $200/$150/max+5
+        cfg.autoSize      := true
+        cfg.sizeUpEvery   := 200.0
+        cfg.sizeDownEvery := 150.0
+        cfg.sizeMax       := 5
+    else if root == "MNQ"
+        cfg.emaLen     := 11
+        cfg.resetTp    := true
+        // NQ ATR-based stop ~$128 (swingSize 1.6 × ~$80 MNQ ATR); TP must be 1.5x = $192+
+        cfg.initTp     := 200.0
+        // maxLoss caps individual risk; structural stops can be $200+; capped at $100 gives 2:1 R:R
+        cfg.maxLoss    := 100.0
+        cfg.rrGate     := true
+        // Sizing: $200/$150/max+2 — capped at 3c total; 4c tier had 33% win + gap-through risk ($970 worst)
+        cfg.autoSize      := true
+        cfg.sizeUpEvery   := 200.0
+        cfg.sizeDownEvery := 150.0
+        cfg.sizeMax       := 2
+    else if root == "M2K"
+        cfg.swingSize  := 2.1
+        cfg.emaLen     := 8
+        // Critical: resetTp=false causes TP to compound to unusable levels (same bug as MES)
+        cfg.resetTp    := true
+        cfg.rrGate     := true
+        // Sizing: $200/$150/max+3 matches MES risk profile (same $70/contract stop)
+        // $50 threshold (MYM default) scales after 1–2 trades — too aggressive for M2K's volatility
+        cfg.autoSize      := true
+        cfg.sizeUpEvery   := 200.0
+        cfg.sizeDownEvery := 150.0
+        cfg.sizeMax       := 3
+    else if root == "MGC"
+        cfg.swingSize  := 2.1
+        cfg.cooldown   := 6
+        cfg.emaLen     := 7
+        cfg.resetTp    := true
+        // pivotStop removed: pivot stops > $35 TP → failed rrGate → zero trades
+        // rrGate removed: gold ATR × 2.1 swingSize also exceeds $35 TP at 1.5× threshold
+        // Sizing: $200/$150/max+3 — placeholder; calibrate when ready
+        cfg.autoSize      := true
+        cfg.sizeUpEvery   := 200.0
+        cfg.sizeDownEvery := 150.0
+        cfg.sizeMax       := 3
+    else if root == "MBT"
+        cfg.swingSize  := 5.0
+        cfg.cooldown   := 6
+        cfg.emaLen     := 8
+        cfg.resetTp    := true
+        // initTp raised $35→$100: at $35 TP vs $70 stop R:R=0.5 → −EV even at 61% win; $100 gives 1.43:1
+        cfg.initTp     := 100.0
+        // Sizing: $500/$300/max+2 — conservative given BTC per-trade dollar swings
+        cfg.autoSize      := true
+        cfg.sizeUpEvery   := 500.0
+        cfg.sizeDownEvery := 300.0
+        cfg.sizeMax       := 2
+    cfg
+
+// ── Input Groups ──────────────────────────────────────────────────────────────
+var string GRP_AUTO = "Instrument Auto-Config"
+var string GRP_COMP = "Compounding & Risk Controls"
+var string GRP_TOD  = "Time-of-Day Windows (America/Chicago)"
+var string GRP_SIG  = "Signal Settings"
+var string GRP_BIAS = "Day Bias (Direction Override)"
+var string GRP_SIZE = "Position Sizing"
+var string GRP_RISK = "Risk Management"
+var string GRP_FILT = "Signal Filters"
+var string GRP_SES  = "Session & Hours (CME Futures)"
+var string GRP_EXEC = "Order Execution (TradersPost)"
+var string GRP_VIS  = "Visuals"
+
+// ── Auto-Config ───────────────────────────────────────────────────────────────
+bool autoConfig = input.bool(true, "Auto-Configure by Instrument",
+    tooltip = "Applies calibrated settings for MYM, MES, MNQ, M2K, MGC, MBT. Manual filter inputs below are overridden.",
+    group   = GRP_AUTO)
+
+int contracts = input.int(1, "Contracts per Trade",
+    minval  = 1,
+    tooltip = "Start at 1 contract. Scale up only after consistent live profitability at this level.",
+    group   = GRP_SIZE)
+
+bool  useAutoSize  = input.bool(true, "Enable Auto Position Sizing",
+    tooltip = "Scales contracts based on cumulative P&L growth and drawdown. The Scale Up/Down thresholds and Max Additional Contracts below are always live — change them and the backtest updates immediately. When Auto-Configure is ON, the per-instrument config determines whether sizing is active for that instrument (currently ON for MES, OFF for others); uncheck this box to disable sizing entirely regardless of auto-config.",
+    group   = GRP_SIZE)
+float sizeUpEvery  = input.float(50.0, "Scale Up Every ($)  [auto-config OFF only]",
+    minval  = 10.0, step = 10.0,
+    tooltip = "Used only when Auto-Configure is OFF. Add 1 contract per $X cumulative profit. When Auto-Configure is ON, calibrated per-instrument values are used instead: MYM $50, MES $200.",
+    group   = GRP_SIZE)
+float sizeDnEvery  = input.float(50.0, "Scale Down Every ($)  [auto-config OFF only]",
+    minval  = 10.0, step = 10.0,
+    tooltip = "Used only when Auto-Configure is OFF. Remove 1 contract per $Y drawdown from peak. When Auto-Configure is ON, calibrated per-instrument values are used instead: MYM $50, MES $150.",
+    group   = GRP_SIZE)
+int   sizeMax      = input.int(3, "Max Additional Contracts  [auto-config OFF only]",
+    minval  = 1, maxval = 20,
+    tooltip = "Used only when Auto-Configure is OFF. Hard cap on extra contracts above base. When Auto-Configure is ON, calibrated per-instrument values are used instead: MYM 3, MES 5.",
+    group   = GRP_SIZE)
+
+string tradeDir = input.string("Both", "Trade Direction",
+    options = ["Both", "Long Only", "Short Only"],
+    tooltip = "Default direction when no Day Bias is active.",
+    group   = GRP_SIG)
+
+// ── Day Bias (Direction Override) ─────────────────────────────────────────────
+// Two modes — only one is active at a time, Apex wins when enabled:
+//
+//   MANUAL  — type any text each morning; fuzzy-matched for "bull"/"bear".
+//             Leave blank to fall back to the Trade Direction setting above.
+//
+//   APEX    — embeds the Apex Adaptive Trend Navigator algorithm directly;
+//             no external indicator required. Reads from any symbol you choose
+//             (e.g. SPY for MES, DIA for MYM) for market-level sentiment.
+
+string manualBiasText = input.string("", "Manual Day Bias  (type bull / bear / neutral / both / blank)",
+    tooltip  = "Fuzzy text match — any word containing 'bull' = long only, 'bear' = short only, 'neutral' or 'both' = both directions. Leave blank to use the Trade Direction setting. Case-insensitive. Example: 'bullish day', 'BEARISH open', 'neutral watch'.",
+    group    = GRP_BIAS)
+
+bool neutralTrades = input.bool(true, "Neutral Bias = Allow Both Directions",
+    tooltip  = "ON (default): when bias is Neutral or unset, both longs and shorts are allowed as normal. OFF: a Neutral bias blocks all new entries — use when you want to sit out unclear days entirely.",
+    group    = GRP_BIAS)
+
+bool useApexBias = input.bool(false, "Use Embedded Apex Trend Signal  (overrides Manual)",
+    tooltip  = "Activates the built-in Apex Adaptive Trend Navigator. Computes on the Trend Reference Symbol below. Overrides the Manual Day Bias. Adapted from Apex Adaptive Trend Navigator [Pineify], MPL 2.0.",
+    group    = GRP_BIAS)
+
+string apexSymbolInput = input.symbol("", "  Trend Reference Symbol  (blank = current chart)",
+    tooltip  = "Symbol whose price drives the Apex trend signal. Blank = current chart instrument. For equity index futures: SPY or XSP (MES), DIA (MYM), QQQ or NDX (MNQ), IWM (M2K). For gold: GC1! For BTC: BTCUSDT or INDEX:BTCUSD.",
+    group    = GRP_BIAS)
+
+string apexModeInput = input.string("Trend (Adaptive MA)", "  Apex Signal Mode",
+    options  = ["Trend (Adaptive MA)", "Structure (BOS/CHoCH)", "Both Agree"],
+    tooltip  = "Trend: price vs adaptive MA — fast and reactive. Structure: Break-of-Structure via higher highs / lower lows — slower, more structural. Both Agree: only directional when MA trend and structure point the same way; Neutral otherwise.",
+    group    = GRP_BIAS)
+
+int apexLen = input.int(20, "  Apex Lookback Period",
+    minval   = 5,
+    tooltip  = "Bars used for efficiency calculation and pivot detection. Default 20 matches the original Apex indicator.",
+    group    = GRP_BIAS)
+
+string apexTimeframe = input.timeframe("D", "  Apex Signal Timeframe",
+    tooltip  = "Timeframe used for Apex trend calculations. 'D' (Daily, default) means the bias is derived from the previous confirmed daily close and stays constant all day — best for backtesting as a proxy for your morning directional read. Use the chart timeframe (leave blank or match your chart) for an intraday trend filter that updates every bar.",
+    group    = GRP_BIAS)
+
+// ── Compounding & Risk Controls ───────────────────────────────────────────────
+float maxDailyLoss = input.float(35.0, "Max Daily Loss ($)",
+    minval  = 1.0, step = 5.0,
+    tooltip = "Hard trading stop for the day once cumulative intraday losses reach this amount. Resets each morning. Increase gradually as the account grows.",
+    group   = GRP_COMP)
+
+int maxConsecLosses = input.int(3, "Max Consecutive Losses",
+    minval  = 1,
+    tooltip = "Trading halts for the day the moment this many losses occur back-to-back, regardless of total dollar loss.",
+    group   = GRP_COMP)
+
+int maxConsecDays = input.int(2, "Max Consecutive Loss Days",
+    minval  = 1,
+    tooltip = "Blocks all new entries on a day if this many consecutive calendar days have each ended with a net loss. A profitable day resets the counter. Example: 2 = after 2 back-to-back losing days, trading is skipped the next day. Provides a circuit-breaker during sustained adverse market conditions.",
+    group   = GRP_COMP)
+
+float initTradeProfit = input.float(35.0, "Initial Trade Profit Target ($)",
+    minval  = 1.0, step = 5.0,
+    tooltip = "Starting dollar take-profit per trade. Converted to a limit price via the instrument's tick value. A warning label appears if the target falls below one tick.",
+    group   = GRP_COMP)
+
+float compoundRatio = input.float(1.1, "Fallback Compound Ratio",
+    minval  = 1.0, step = 0.05,
+    tooltip = "Used when no Time-of-Day window is active (off-hours or all windows disabled). Also the default when time-of-day windows are all OFF. Set 1.0 to disable compounding.",
+    group   = GRP_COMP)
+
+bool resetTpDaily = input.bool(false, "Reset TP Target Each Day",
+    tooltip = "ON: compound profit target resets to Initial Trade Profit Target each morning. OFF: compounded value carries forward across sessions.",
+    group   = GRP_COMP)
+
+float maxLossPerTrade = input.float(70.0, "Max Loss Per Trade ($)",
+    minval  = 1.0, step = 5.0,
+    tooltip = "Hard dollar stop always active on every trade, regardless of pivot stop or breakeven settings. Prevents any single trade losing more than this amount. Default 70 = 2× a $35 TP target. Adjust proportionally when TP changes.",
+    group   = GRP_COMP)
+
+float minTpPct = input.float(40.0, "Minimum TP Floor (% of Initial Target)",
+    minval  = 10.0, maxval = 100.0, step = 5.0,
+    tooltip = "Entries pause when the compounded TP falls below this percentage of the Initial Trade Profit Target. Prevents trading at unfavourable R:R after a loss run. Example: 40% of $35 initial = $14 floor. Scales automatically across instruments and initial target sizes. Entries resume once wins compound the TP back above the floor.",
+    group   = GRP_COMP)
+
+// ── Time-of-Day Windows ───────────────────────────────────────────────────────
+// Each window has an enable toggle and its own compound ratio.
+// When a window is disabled no entries fire during that period.
+// The ratio captured at entry is applied on trade close regardless of exit time.
+
+bool  useWin1  = input.bool(true,  "Enable Morning   07:00 - 11:00 CT",
+    tooltip = "Cleanest directional moves of the day. Institutional position-building hour.",
+    group   = GRP_TOD)
+float win1Ratio = input.float(1.15, "  Morning Compound Ratio",
+    minval  = 1.0, step = 0.05,
+    tooltip = "Higher ratio rewards the stronger morning trend bias. Applied to win/loss compounding for trades entered in this window.",
+    group   = GRP_TOD)
+
+bool  useWin2  = input.bool(false, "Enable Midday    11:00 - 13:00 CT",
+    tooltip = "Lunch-hour chop — often the weakest signal quality of the day. Disabled by default.",
+    group   = GRP_TOD)
+float win2Ratio = input.float(1.0,  "  Midday Compound Ratio",
+    minval  = 1.0, step = 0.05,
+    tooltip = "Set to 1.0 (no compounding) by default — midday signals are lower confidence.",
+    group   = GRP_TOD)
+
+bool  useWin3  = input.bool(true,  "Enable Afternoon 13:00 - 16:00 CT",
+    tooltip = "Post-lunch trend continuation or late-day momentum. Generally better than midday.",
+    group   = GRP_TOD)
+float win3Ratio = input.float(1.05, "  Afternoon Compound Ratio",
+    minval  = 1.0, step = 0.05,
+    tooltip = "Moderate ratio — afternoon moves are real but shorter than morning.",
+    group   = GRP_TOD)
+
+bool  useWin4  = input.bool(false, "Enable Late Day  16:00 - 17:00 CT",
+    tooltip = "Final hour before EOD close. Thin liquidity and erratic moves. Disabled by default.",
+    group   = GRP_TOD)
+float win4Ratio = input.float(1.0,  "  Late Day Compound Ratio",
+    minval  = 1.0, step = 0.05,
+    tooltip = "Set to 1.0 (no compounding) — late-day signals are lowest confidence.",
+    group   = GRP_TOD)
+
+// ── Risk Management ───────────────────────────────────────────────────────────
+bool  useStopLoss   = input.bool(true,  "Enable Pivot Stop",
+    tooltip = "Stop just beyond the swing pivot — the natural Gann invalidation level. [Overridden when Auto-Config is ON]",
+    group   = GRP_RISK)
+float pivotBuffer   = input.float(0.25, "Pivot Buffer (x ATR)",
+    minval  = 0.0, step = 0.05,
+    tooltip = "ATR cushion past the pivot to avoid exact-level stop-outs.",
+    group   = GRP_RISK)
+bool  useBreakeven  = input.bool(false, "Enable Auto Breakeven",
+    tooltip = "Once the trade moves N x ATR in your favor the stop shifts to entry + buffer. [Overridden when Auto-Config is ON]",
+    group   = GRP_RISK)
+float beTriggerMult = input.float(2.0,  "Breakeven Trigger (x ATR)",
+    minval  = 0.5, step = 0.5, group = GRP_RISK)
+float beBuffer      = input.float(0.5,  "Breakeven Buffer (x ATR)",
+    minval  = 0.0, step = 0.25, group = GRP_RISK)
+float beFloorDollars = input.float(15.0, "Breakeven Dollar Floor ($)",
+    minval  = 0.0, step = 5.0,
+    tooltip = "BE also triggers when favorable excursion reaches this dollar amount, regardless of ATR multiple. Acts as a safety net in high-volatility markets where ATR is large and the ATR-based trigger fires too late. Set 0 to disable. Default $15 = trigger BE once the trade is $15 in your favour.",
+    group   = GRP_RISK)
+
+bool  useRRGate = input.bool(true, "Enable R:R Gate",
+    tooltip = "Blocks entries where the reward (TP distance) divided by the risk (stop distance) falls below the minimum. When Pivot Stop is OFF, 1x ATR is used as the implied risk.",
+    group   = GRP_RISK)
+float rrMin     = input.float(1.5, "Min Reward:Risk Ratio",
+    minval  = 0.5, step = 0.25,
+    tooltip = "1.5 means the TP target must be at least 1.5x the stop distance. Raise to 2.0 for higher-quality entries only.",
+    group   = GRP_RISK)
+
+// ── Signal Filters ────────────────────────────────────────────────────────────
+bool  useTrendFilter = input.bool(true,  "Enable Trend Filter",
+    tooltip = "Long signals only above the EMA; short signals only below it.",
+    group   = GRP_FILT)
+int   trendLen       = input.int(20,     "Trend EMA Length",
+    minval  = 5,
+    tooltip = "[Overridden when Auto-Config is ON]",
+    group   = GRP_FILT)
+bool  useSwingSize   = input.bool(true,  "Enable Minimum Swing Size",
+    tooltip = "Swing leg must be at least N x ATR. Filters micro choppy flips.",
+    group   = GRP_FILT)
+float atrMult        = input.float(1.8,  "Min Swing Size (x ATR)",
+    minval  = 0.1, step = 0.1,
+    tooltip = "[Overridden when Auto-Config is ON]",
+    group   = GRP_FILT)
+bool  useCooldown    = input.bool(true,  "Enable Cooldown",
+    tooltip = "Blocks re-entry for N bars after any trade closes.",
+    group   = GRP_FILT)
+int   cooldownBars   = input.int(4,      "Cooldown (bars)",
+    minval  = 1,
+    tooltip = "[Overridden when Auto-Config is ON]",
+    group   = GRP_FILT)
+
+// ── Session ───────────────────────────────────────────────────────────────────
+// NOTE: input.session() with a TZ override silently fails on 24h continuous
+// futures contracts in TradingView — session strings are not reliable for
+// overnight Globex data. Direct hour()/minute() comparisons are used instead.
+// All times are America/Chicago (CT).
+// IMPORTANT — CME equity index futures (MYM, MES, MNQ, M2K) halt from
+// 16:00–16:30 CT daily.  Default times below keep all activity before that
+// window.  If you trade MGC (gold halts 17:00–18:00 CT) or MBT (24/7) you
+// can push these later.  Watchlist alerts do not fire during maintenance halts
+// regardless of what the strategy logic requests.
+int  sessionStartHr = input.int(7,  "Session Start Hour (CT, 24h)",
+    minval  = 0, maxval = 23,
+    tooltip = "Entries allowed from this CT hour onward. Default 7 = 07:00 CT.",
+    group   = GRP_SES)
+int  sessionEndHr   = input.int(16, "Session End Hour (CT, 24h)",
+    minval  = 0, maxval = 23,
+    tooltip = "Absolute session end — used only for the inSession flag, not for EOD close timing.",
+    group   = GRP_SES)
+int  sessionOpenBuffer = input.int(2, "Session Open Buffer (bars)",
+    minval  = 0, maxval = 20,
+    tooltip = "Skip this many bars after session start before allowing entries. Prevents acting on swing state built during pre-market. Default 2 = 10 minutes on a 5-min chart.",
+    group   = GRP_SES)
+int  entryLockHr    = input.int(15, "Lock New Entries After Hour (CT)",
+    minval  = 0, maxval = 23,
+    tooltip = "No new entries at or after this hour + minute. Default 15 keeps the lock well before the 16:00 CT maintenance halt.",
+    group   = GRP_SES)
+int  entryLockMin   = input.int(30, "Lock New Entries After Minute",
+    minval  = 0, maxval = 59,
+    tooltip = "Combined with Lock Hour — no new entries after HH:MM CT. Default 15:30 CT.",
+    group   = GRP_SES)
+int  eodCloseHr     = input.int(15, "EOD Force-Close Hour (CT)",
+    minval  = 0, maxval = 23,
+    tooltip = "Force-close fires at eodCloseHr:eodCloseMin CT. Default 15 (3pm). Must be before 16:00 CT for equity index futures to avoid the maintenance halt.",
+    group   = GRP_SES)
+int  eodMinute      = input.int(45, "EOD Force-Close Minute (CT)",
+    minval  = 0, maxval = 59,
+    tooltip = "Combined with EOD Hour. Default 45 = 15:45 CT — ahead of broker auto-liquidation at 3:45 CT. Also clears before the 16:00 CME maintenance halt.",
+    group   = GRP_SES)
+var string TZ = "America/Chicago"
+
+// ── Order Execution ───────────────────────────────────────────────────────────
+bool useMarketOrders = input.bool(true, "Use Market Orders",
+    tooltip = "ON = no price field sent, TradersPost submits a market order (recommended). OFF = limit at close +/- pad ticks.",
+    group   = GRP_EXEC)
+int padTicks = input.int(4, "Entry Pad (ticks, limit mode only)",
+    minval  = 1, maxval = 50,
+    tooltip = "Only used when Market Orders is OFF.",
+    group   = GRP_EXEC)
+
+// ── Visuals ───────────────────────────────────────────────────────────────────
+bool  drawArrows  = input.bool(true,          "Draw Arrows",              group = GRP_VIS)
+bool  drawLines   = input.bool(true,          "Draw Swing Lines",         group = GRP_VIS)
+bool  drawEma     = input.bool(true,          "Draw Trend EMA",           group = GRP_VIS)
+bool  showStatus  = input.bool(true,          "Show Status Label",        group = GRP_VIS)
+color upColor     = input.color(color.lime,   "Buy Arrow Color",          group = GRP_VIS)
+color dnColor     = input.color(color.red,    "Sell Arrow Color",         group = GRP_VIS)
+color lineColor   = input.color(color.yellow, "Swing Line Color",         group = GRP_VIS)
+color emaColor    = input.color(color.aqua,   "Trend EMA Color",          group = GRP_VIS)
+int   lineWt      = input.int(2, "Line Weight", minval = 1, maxval = 5,   group = GRP_VIS)
+
+// ── Resolve Effective Signal Parameters ───────────────────────────────────────
+InstrumentConfig cfg = getConfig(syminfo.root)
+
+bool  effPivotStop = autoConfig ? cfg.pivotStop : useStopLoss
+float effSwingSize = autoConfig ? cfg.swingSize : atrMult
+int   effCooldown  = autoConfig ? cfg.cooldown  : cooldownBars
+bool  effBreakeven = autoConfig ? cfg.breakeven : useBreakeven
+
+// ta.ema, ta.pivothigh, ta.pivotlow, and request.security timeframe all require
+// simple int / simple string.  Switch expressions with literal arms return simple
+// values — struct field access does not, hence these parallel switch statements.
+int cfgEmaLen = switch syminfo.root
+    "MYM" => 17
+    "MES" => 18
+    "MNQ" => 11
+    "M2K" =>  8
+    "MGC" =>  7
+    "MBT" =>  8
+    => 20
+int effEmaLen = autoConfig ? cfgEmaLen : trendLen
+
+int cfgApexPeriod = switch syminfo.root
+    "MYM" => 9
+    "MES" => 8
+    => 20
+int effApexPeriod = autoConfig ? cfgApexPeriod : apexLen
+
+string cfgApexTf = switch syminfo.root
+    "MYM" => "120"
+    => "D"
+string effApexTfInput = autoConfig ? cfgApexTf : apexTimeframe
+
+// ── Resolved Risk Management ──────────────────────────────────────────────────
+float effPivotBuf   = autoConfig ? cfg.pivotBuf   : pivotBuffer
+float effBeTrigger  = autoConfig ? cfg.beTrigger  : beTriggerMult
+float effBeBuf      = autoConfig ? cfg.beBuf      : beBuffer
+bool  effRRGate     = autoConfig ? cfg.rrGate     : useRRGate
+float effRRMin      = autoConfig ? cfg.rrMinVal   : rrMin
+
+// ── Resolved Compounding Controls ────────────────────────────────────────────
+bool  effResetTp    = autoConfig ? cfg.resetTp    : resetTpDaily
+float effInitTp     = autoConfig ? cfg.initTp     : initTradeProfit
+float effMaxDaily   = autoConfig ? cfg.maxDaily    : maxDailyLoss
+int   effMaxConsec  = autoConfig ? cfg.maxConsec   : maxConsecLosses
+float effMaxLoss    = autoConfig ? cfg.maxLoss     : maxLossPerTrade
+float effFallRatio  = autoConfig ? cfg.fallRatio   : compoundRatio
+
+// ── Resolved Time Windows ─────────────────────────────────────────────────────
+bool  effW1En       = autoConfig ? cfg.w1En        : useWin1
+float effW1Ratio    = autoConfig ? cfg.w1Ratio     : win1Ratio
+bool  effW2En       = autoConfig ? cfg.w2En        : useWin2
+float effW2Ratio    = autoConfig ? cfg.w2Ratio     : win2Ratio
+bool  effW3En       = autoConfig ? cfg.w3En        : useWin3
+float effW3Ratio    = autoConfig ? cfg.w3Ratio     : win3Ratio
+bool  effW4En       = autoConfig ? cfg.w4En        : useWin4
+float effW4Ratio    = autoConfig ? cfg.w4Ratio     : win4Ratio
+
+// ── Resolved Position Sizing ──────────────────────────────────────────────────
+// Enable: checkbox AND per-instrument auto-config flag.
+//   useAutoSize=false  → sizing OFF regardless of auto-config (checkbox always wins)
+//   useAutoSize=true   → auto-config determines if this instrument has sizing ON
+//   autoConfig=false   → useAutoSize alone decides; thresholds from UI inputs
+// Thresholds: auto-config ON → per-instrument calibrated UDT values (MYM $50/$50/3, MES $200/$150/5)
+//             auto-config OFF → UI inputs (use for calibrating new instruments)
+bool  effAutoSize    = useAutoSize and (autoConfig ? cfg.autoSize : true)
+float effSizeUpEvery = autoConfig ? cfg.sizeUpEvery   : sizeUpEvery
+float effSizeDnEvery = autoConfig ? cfg.sizeDownEvery : sizeDnEvery
+int   effSizeMax     = autoConfig ? cfg.sizeMax       : sizeMax
+
+// ── Resolved Day Bias Config ──────────────────────────────────────────────────
+bool   effUseApex      = autoConfig ? cfg.useApex     : useApexBias
+string effApexMode     = autoConfig ? cfg.apexMode    : apexModeInput
+bool   effNeutralTrades = autoConfig ? cfg.neutralBias : neutralTrades
+
+float entryPad = padTicks * syminfo.mintick
+
+// ── Tick Value ────────────────────────────────────────────────────────────────
+// Dollar value of one minimum price movement: mintick x pointvalue.
+// Used to convert dollar TP targets into price distances and to
+// validate that inputs are achievable on the current instrument.
+float tickVal = syminfo.mintick * syminfo.pointvalue
+
+// ── Compounding & Daily Risk State ────────────────────────────────────────────
+var float dynamicTp          = 0.0   // compound-adjusted profit target ($)
+var float dailyLoss          = 0.0   // cumulative intraday loss — resets daily
+var int   consecLosses       = 0     // consecutive losing trades — resets daily
+var bool  dailyHalted        = false // no new entries until next session day
+var float entryCompoundRatio = 1.0   // ratio captured at entry, used on close
+var int   prevClosedCount    = 0
+var float entryAtr           = na
+var float pivotStopPrice     = na
+var bool  beTriggered        = false
+var int   lastExit           = na
+var float dayPnl             = 0.0   // net P&L for current calendar day (wins + losses)
+var float prevDayPnl         = na    // previous day's net P&L — set at day boundary
+var int   consecLossDays     = 0     // consecutive days that ended with a net loss
+var float sizingCumPnl       = 0.0   // cumulative strategy P&L for contract scaling
+var float sizingPeak         = 0.0   // peak of sizingCumPnl — drawdown measured from here
+
+if barstate.isfirst
+    dynamicTp          := effInitTp
+    entryCompoundRatio := effFallRatio
+
+// ── Daily Reset ───────────────────────────────────────────────────────────────
+bool newDay = ta.change(time("D")) != 0
+if newDay
+    // Consecutive loss day tracking: save yesterday's P&L then update streak.
+    // Must happen before dayPnl is reset so we capture yesterday's full result.
+    prevDayPnl := dayPnl
+    if prevDayPnl < 0.0
+        consecLossDays := consecLossDays + 1
+        // When the consecutive-loss-day halt fires, reset auto-sizing state.
+        // Contracts return to the base level so trading resumes conservatively
+        // after a sustained drawdown, rather than re-entering at inflated size.
+        if effAutoSize and consecLossDays >= maxConsecDays
+            sizingCumPnl := 0.0
+            sizingPeak   := 0.0
+    else
+        consecLossDays := 0
+    dayPnl       := 0.0
+    dailyLoss    := 0.0
+    consecLosses := 0
+    dailyHalted  := false
+    if effResetTp
+        dynamicTp := effInitTp
+
+// ── TP Validation & Computation ───────────────────────────────────────────────
+// tpTooSmall:  dynamicTp compounded below one tick — target meaningless.
+// dlTooNarrow: maxDailyLoss below one tick — any single loss triggers halt.
+// tpBelowFloor: TP compounded down below minTpPct of the initial target —
+//               entries pause until wins rebuild it back above the floor.
+//               This is a temporary trading pause, not a configuration error.
+bool  tpTooSmall  = dynamicTp < tickVal
+bool  dlTooNarrow = effMaxDaily < tickVal
+bool  showWarning = tpTooSmall or dlTooNarrow
+
+float minViableTp  = effInitTp * minTpPct / 100.0
+bool  tpBelowFloor = dynamicTp < minViableTp
+
+float effectiveTp   = math.max(dynamicTp, tickVal)           // floor at 1 tick
+float tpTicks       = math.ceil(effectiveTp / tickVal)       // ceiling to nearest tick
+float tpDist        = tpTicks * syminfo.mintick              // price distance for limit
+
+// Hard per-trade stop: always active regardless of pivot/breakeven settings.
+// Converts maxLossPerTrade dollars to a price distance (rounded up to whole ticks).
+float hardStopDist  = math.ceil(effMaxLoss / tickVal) * syminfo.mintick
+
+// BE dollar floor: converts beFloorDollars to a price distance (rounded up to ticks).
+// Used as an alternative BE trigger when beFloorDollars > 0. The actual trigger
+// distance is the minimum of (ATR-based, dollar-floor) — whichever fires first.
+float beFloorDist   = beFloorDollars > 0 ? math.ceil(beFloorDollars / tickVal) * syminfo.mintick : na
+
+// ── Session Windows ───────────────────────────────────────────────────────────
+// Direct hour/minute comparisons — reliable on 24h continuous Globex futures.
+// input.session() with TZ overrides silently fails on overnight contracts.
+int  barH      = hour(time, TZ)
+int  barM      = minute(time, TZ)
+bool inSession = barH >= sessionStartHr and barH < sessionEndHr
+bool afterLock = barH > entryLockHr or (barH == entryLockHr and barM >= entryLockMin)
+
+// isEod: explicit hour:minute pair — independent of sessionEndHr so it can be
+// placed before the CME maintenance halt regardless of sessionEndHr setting.
+bool isEod     = barH > eodCloseHr or (barH == eodCloseHr and barM >= eodMinute)
+
+// Session open buffer: skip the first N bars after the session gate opens to
+// let pre-market swing state settle before accepting entries.
+var int  sessionOpenBar   = na
+bool     sessionJustOpened = inSession and not inSession[1]
+if sessionJustOpened
+    sessionOpenBar := bar_index
+bool bufferOk      = na(sessionOpenBar) or (bar_index - sessionOpenBar >= sessionOpenBuffer)
+
+bool inEntryWindow = inSession and not afterLock and not isEod and bufferOk
+
+// ── Time-of-Day Window Logic ──────────────────────────────────────────────────
+// Uses barH already computed in the Session Windows section above.
+// Windows are mutually exclusive and cover the full session.
+bool inWin1  = barH >= 7  and barH < 11   // 07:00-11:00 Morning
+bool inWin2  = barH >= 11 and barH < 13   // 11:00-13:00 Midday
+bool inWin3  = barH >= 13 and barH < 16   // 13:00-16:00 Afternoon
+bool inWin4  = barH >= 16                 // 16:00-17:00 Late Day
+
+// windowEnabled: true only when we are inside an enabled time window.
+// Used as an entry gate — disabled windows block all new entries.
+bool windowEnabled = (inWin1 and effW1En) or (inWin2 and effW2En) or
+                     (inWin3 and effW3En) or (inWin4 and effW4En)
+
+// effWindowRatio: the compound ratio for the currently active window.
+// Falls back to the global compoundRatio when no window is active.
+float effWindowRatio = inWin1 ? effW1Ratio :
+                       inWin2 ? effW2Ratio :
+                       inWin3 ? effW3Ratio :
+                       inWin4 ? effW4Ratio : effFallRatio
+
+// Active window name for status label display.
+string winName = inWin1 ? "Morning (07-11)" :
+                 inWin2 ? "Midday  (11-13)" :
+                 inWin3 ? "Afternoon(13-16)" :
+                 inWin4 ? "Late Day(16-17)" : "Off-Hours"
+
+// ── ATR (Wilder RMA, 100-bar) ─────────────────────────────────────────────────
+float atr = ta.rma(ta.tr(true), 100)
+
+// ── Trend EMA ─────────────────────────────────────────────────────────────────
+float trendEma = ta.ema(close, effEmaLen)
+bool  trendUp  = close > trendEma
+bool  trendDn  = close < trendEma
+
+plot(drawEma and useTrendFilter ? trendEma : na,
+     title = "Trend EMA", color = emaColor, linewidth = 2)
+
+// ── Bar Classification ────────────────────────────────────────────────────────
+bool isUp         = high > high[1] and low > low[1]
+bool isDown       = high < high[1] and low < low[1]
+bool isMeaningful = isUp or isDown
+
+// ── Swing State ───────────────────────────────────────────────────────────────
+var SwingState  st     = SwingState.new()
+var PivotPoints pivots = PivotPoints.new()
+
+// ── Swing Detection ───────────────────────────────────────────────────────────
+bool swingLow  = isMeaningful and isUp   and st.lastWasDn
+bool swingHigh = isMeaningful and isDown and st.lastWasUp
+
+// ── State Update ──────────────────────────────────────────────────────────────
+if isMeaningful
+    st.lastWasUp := isUp
+    st.lastWasDn := isDown
+    if isUp
+        st.upHigh := high
+        st.upBar  := bar_index
+    if isDown
+        st.downLow := low
+        st.downBar := bar_index
+
+// ── Filter Evaluation ─────────────────────────────────────────────────────────
+bool trendOkLong  = not useTrendFilter or trendUp
+bool trendOkShort = not useTrendFilter or trendDn
+
+float swingLeg    = math.abs(st.upHigh - st.downLow)
+bool  sizeOkLong  = not useSwingSize or (not na(swingLeg) and swingLeg >= effSwingSize * atr)
+bool  sizeOkShort = sizeOkLong
+
+bool cooldownOk = not useCooldown or na(lastExit) or (bar_index - lastExit >= effCooldown)
+
+// ── Apex Adaptive Trend (Embedded) ────────────────────────────────────────────
+// Adapted from "Apex Adaptive Trend Navigator [Pineify]" (MPL 2.0 © Pineify).
+// Efficiency = |net price move over N bars| / |sum of all bar-to-bar moves|
+// — a KAMA-style adaptive factor.  apexTrendDir: price vs adaptive MA.
+// apexStructDir: Break-of-Structure via higher swing highs / lower swing lows.
+string apexTicker   = str.length(apexSymbolInput) > 0 ? apexSymbolInput : syminfo.tickerid
+string apexTf       = str.length(effApexTfInput) > 0 ? effApexTfInput : timeframe.period
+[apexSrc, apexHi, apexLo] = request.security(apexTicker, apexTf, [close, high, low], lookahead = barmerge.lookahead_off)
+
+float apexPriceChg  = apexSrc - apexSrc[effApexPeriod]
+float apexAbsChg    = math.abs(apexPriceChg)
+float apexSumChg    = math.sum(math.abs(apexSrc - apexSrc[1]), effApexPeriod)
+float apexEff       = apexSumChg > 0 ? apexAbsChg / apexSumChg : 0.0
+var float apexMa    = na
+apexMa             := nz(apexMa[1], apexSrc) + math.pow(apexEff, 2) * (apexSrc - nz(apexMa[1], apexSrc))
+int apexTrendDir    = apexSrc > apexMa ? 1 : -1
+
+float apexPivHi     = ta.pivothigh(apexHi, effApexPeriod, effApexPeriod)
+float apexPivLo     = ta.pivotlow(apexLo,  effApexPeriod, effApexPeriod)
+var float apexLastHi = na
+var float apexLastLo = na
+var int   apexStructDir = 0
+
+if not na(apexPivHi)
+    float newHi = apexHi[apexLen]
+    if not na(apexLastHi)
+        apexStructDir := newHi > apexLastHi ? 1 : -1
+    apexLastHi := newHi
+
+if not na(apexPivLo)
+    float newLo = apexLo[apexLen]
+    if not na(apexLastLo)
+        apexStructDir := newLo < apexLastLo ? -1 : 1
+    apexLastLo := newLo
+
+// ── Day Bias Resolution ───────────────────────────────────────────────────────
+// Manual path: fuzzy keyword match — empty text falls back to tradeDir.
+bool   mbIsBull    = str.contains(str.lower(manualBiasText), "bull")
+bool   mbIsBear    = str.contains(str.lower(manualBiasText), "bear")
+bool   mbIsNeut    = str.contains(str.lower(manualBiasText), "neutral") or str.contains(str.lower(manualBiasText), "both")
+bool   mbHasSignal = mbIsBull or mbIsBear or mbIsNeut
+string manualBias  = mbHasSignal ? (mbIsBull ? "Bullish" : mbIsBear ? "Bearish" : "Neutral") : "UseTradeDir"
+
+// Apex path: derive from embedded calculations according to selected mode.
+bool apexTrendBull  = apexTrendDir  ==  1
+bool apexTrendBear  = apexTrendDir  == -1
+bool apexStructBull = apexStructDir ==  1
+bool apexStructBear = apexStructDir == -1
+bool apexBull = effApexMode == "Structure (BOS/CHoCH)" ? apexStructBull : effApexMode == "Both Agree" ? (apexTrendBull and apexStructBull) : apexTrendBull
+bool apexBear = effApexMode == "Structure (BOS/CHoCH)" ? apexStructBear : effApexMode == "Both Agree" ? (apexTrendBear and apexStructBear) : apexTrendBear
+string apexBias = apexBull ? "Bullish" : apexBear ? "Bearish" : "Neutral"
+
+// effectiveBias: Apex wins when ON, else manual, else UseTradeDir.
+string effectiveBias = effUseApex ? apexBias : manualBias
+
+// biasAllowLong/Short: the final entry direction gate.
+//   UseTradeDir → respect the Trade Direction dropdown as normal.
+//   Neutral     → allow both if effNeutralTrades=ON, block all if OFF.
+//   Bullish/Bearish → override Trade Direction entirely.
+// effNeutralTrades: resolved from auto-config (per-instrument) or manual input.
+// MES auto-config locks this OFF — when Apex is neutral/unclear, no entries fire.
+bool biasIsNeutral  = effectiveBias == "Neutral"
+bool biasAllowLong  = effectiveBias == "UseTradeDir" ? (tradeDir != "Short Only") : (effectiveBias == "Bullish" or (biasIsNeutral and effNeutralTrades))
+bool biasAllowShort = effectiveBias == "UseTradeDir" ? (tradeDir != "Long Only")  : (effectiveBias == "Bearish" or (biasIsNeutral and effNeutralTrades))
+
+// Status label display strings.
+string apexSymDisp  = str.length(apexSymbolInput) > 0 ? apexSymbolInput : syminfo.root
+string apexArrow    = apexTrendDir == 1 ? "↑" : "↓"
+string biasTag      = effUseApex ? " (Apex:" + apexSymDisp + " " + apexArrow + ")" : mbHasSignal ? " (manual)" : " (tradeDir)"
+string biasDisplay  = effectiveBias + biasTag
+
+// ── R:R Gate ─────────────────────────────────────────────────────────────────
+// Stop distance uses the actual pivot level when Pivot Stop is ON.
+// Falls back to 1x ATR when Pivot Stop is OFF (no explicit stop defined).
+// tpDist / stopDist must meet rrMin to allow entry.
+float longStopLevel  = st.downLow - effPivotBuf * atr
+float longStopDist   = effPivotStop ? math.max(close - longStopLevel, syminfo.mintick) : atr
+float longRR         = tpDist / longStopDist
+bool  rrOkLong       = not effRRGate or longRR >= effRRMin
+
+float shortStopLevel = st.upHigh + effPivotBuf * atr
+float shortStopDist  = effPivotStop ? math.max(shortStopLevel - close, syminfo.mintick) : atr
+float shortRR        = tpDist / shortStopDist
+bool  rrOkShort      = not effRRGate or shortRR >= effRRMin
+
+// ── Entry Gate ────────────────────────────────────────────────────────────────
+// Entries blocked when:
+//   dailyHalted      — max daily loss or consecutive loss limit reached
+//   consecDayHalted  — too many consecutive calendar days ended with a net loss
+//   showWarning      — TP or daily loss target below one tick
+//   not windowEnabled   — current time is outside all enabled windows
+//   not rrOkLong/Short  — R:R below minimum threshold for this direction
+//   not biasAllowLong/Short — day bias blocks this direction
+// biasAllow already incorporates tradeDir as a fallback — no separate check needed.
+// tpBelowFloor pauses entries when compounding has driven the TP below the
+// minimum viable threshold — entries resume automatically when TP recovers.
+bool consecDayHalted = consecLossDays >= maxConsecDays
+
+// ── Auto Position Sizing — contract count ─────────────────────────────────────
+// sizeExtra: floor(cumProfit / upEvery) - floor(drawdown / dnEvery), clamped 0..sizeMax.
+// Uses cumulative net P&L from all closed trades since strategy start.
+// Drawdown is measured from the running peak of that cumulative P&L.
+// Updated one bar after each trade close (var state carries forward).
+float sizingDrawdown = math.max(0.0, sizingPeak - sizingCumPnl)
+int   sizeExtra      = effAutoSize ? math.max(0, math.min(effSizeMax,
+     int(math.floor(math.max(0.0, sizingCumPnl) / effSizeUpEvery)) -
+     int(math.floor(sizingDrawdown / effSizeDnEvery)))) : 0
+int   effContracts   = contracts + sizeExtra
+
+bool goLong  = swingLow  and inEntryWindow and cooldownOk and trendOkLong  and sizeOkLong
+               and biasAllowLong
+               and not dailyHalted and not consecDayHalted and not showWarning and not tpBelowFloor
+               and windowEnabled and rrOkLong
+
+bool goShort = swingHigh and inEntryWindow and cooldownOk and trendOkShort and sizeOkShort
+               and biasAllowShort
+               and not dailyHalted and not consecDayHalted and not showWarning and not tpBelowFloor
+               and windowEnabled and rrOkShort
+
+// ── Entries ───────────────────────────────────────────────────────────────────
+if goLong
+    entryAtr           := atr
+    beTriggered        := false
+    pivotStopPrice     := st.downLow
+    entryCompoundRatio := effWindowRatio   // capture window ratio at entry time
+    strategy.entry("Long", strategy.long, qty = effContracts, comment = "SwingLow")
+    string bTicker = syminfo.ticker
+    string bQty    = str.tostring(effContracts)
+    string buyMsg  = useMarketOrders ?
+         '{"ticker":"' + bTicker + '","action":"buy","sentiment":"bullish","quantity":' + bQty + '}' :
+         '{"ticker":"' + bTicker + '","action":"buy","sentiment":"bullish","price":"' + str.tostring(close + entryPad, format.mintick) + '","quantity":' + bQty + '}'
+    alert(buyMsg, alert.freq_once_per_bar)
+
+if goShort
+    entryAtr           := atr
+    beTriggered        := false
+    pivotStopPrice     := st.upHigh
+    entryCompoundRatio := effWindowRatio   // capture window ratio at entry time
+    strategy.entry("Short", strategy.short, qty = effContracts, comment = "SwingHigh")
+    string sTicker = syminfo.ticker
+    string sQty    = str.tostring(effContracts)
+    string sellMsg = useMarketOrders ?
+         '{"ticker":"' + sTicker + '","action":"sell","sentiment":"bearish","quantity":' + sQty + '}' :
+         '{"ticker":"' + sTicker + '","action":"sell","sentiment":"bearish","price":"' + str.tostring(close - entryPad, format.mintick) + '","quantity":' + sQty + '}'
+    alert(sellMsg, alert.freq_once_per_bar)
+
+// ── Auto Breakeven Check ──────────────────────────────────────────────────────
+if effBreakeven and not beTriggered and not na(entryAtr)
+    // beTrigDist: the smaller of the ATR-based trigger and the dollar floor.
+    // Whichever is closer to entry fires first. When beFloorDollars = 0 the
+    // floor is na so we fall back to the ATR-only distance.
+    float atrBeDist  = effBeTrigger * entryAtr
+    float beTrigDist = na(beFloorDist) ? atrBeDist : math.min(atrBeDist, beFloorDist)
+    if strategy.position_size > 0
+        if high >= strategy.position_avg_price + beTrigDist
+            beTriggered := true
+    if strategy.position_size < 0
+        if low <= strategy.position_avg_price - beTrigDist
+            beTriggered := true
+
+// ── Exit Orders — TP limit + stop (OCO) ──────────────────────────────────────
+// strategy.exit submits a limit (TP) and stop simultaneously.
+// Whichever fills first cancels the other.
+// Re-submitted each bar so tpDist stays current if dynamicTp changes.
+//
+// Stop hierarchy (most protective wins):
+//   hardStop — always present; dollar-based floor via maxLossPerTrade
+//   pivStop  — optional pivot level; tighter than hardStop when pivot is nearby
+//   beStop   — overrides both after breakeven trigger; locks in small profit
+//
+// For longs: stop triggers when price FALLS to the level → take the HIGHEST
+//   (most protective = closest to entry from below)
+// For shorts: stop triggers when price RISES to the level → take the LOWEST
+//   (most protective = closest to entry from above, or below entry after BE)
+if strategy.position_size > 0 and not na(entryAtr)
+    float tpLimit  = strategy.position_avg_price + tpDist
+    float hardStop = strategy.position_avg_price - hardStopDist
+    float pivStop  = effPivotStop ? pivotStopPrice - effPivotBuf * entryAtr : na
+    float beStop   = effBreakeven ? strategy.position_avg_price + effBeBuf * entryAtr : na
+    float baseStop = beTriggered  ? beStop : pivStop
+    // math.max: for longs, higher stop = more protective (triggers sooner on reversal)
+    float actStop  = na(baseStop) ? hardStop : math.max(hardStop, baseStop)
+    string lossLbl = beTriggered ? "BE Stop" : effPivotStop ? "Pivot Stop" : "Hard Stop"
+    strategy.exit("Long Exit", from_entry = "Long",
+        limit          = tpLimit,
+        stop           = actStop,
+        comment_profit = "TP Hit",
+        comment_loss   = lossLbl)
+
+if strategy.position_size < 0 and not na(entryAtr)
+    float tpLimit  = strategy.position_avg_price - tpDist
+    float hardStop = strategy.position_avg_price + hardStopDist
+    float pivStop  = effPivotStop ? pivotStopPrice + effPivotBuf * entryAtr : na
+    float beStop   = effBreakeven ? strategy.position_avg_price - effBeBuf * entryAtr : na
+    float baseStop = beTriggered  ? beStop : pivStop
+    // math.min: for shorts, lower stop = more protective (triggers sooner on reversal)
+    float actStop  = na(baseStop) ? hardStop : math.min(hardStop, baseStop)
+    string sLossLbl = beTriggered ? "BE Stop" : effPivotStop ? "Pivot Stop" : "Hard Stop"
+    strategy.exit("Short Exit", from_entry = "Short",
+        limit          = tpLimit,
+        stop           = actStop,
+        comment_profit = "TP Hit",
+        comment_loss   = sLossLbl)
+
+// ── EOD Force-Close ───────────────────────────────────────────────────────────
+if isEod and strategy.position_size != 0
+    strategy.close_all(comment = "EOD Close")
+    lastExit := bar_index
+
+// ── Trade Close Detection — compounding + daily risk + alerts ─────────────────
+// Fires on every close type: TP hit, stop, reversal, EOD.
+// Uses entryCompoundRatio (captured at entry) — not the current window ratio —
+// so a morning trade compounds at the morning rate even if it closes at noon.
+string exitMsg = '{"ticker":"' + syminfo.ticker + '","action":"exit"}'
+
+if strategy.closedtrades > prevClosedCount
+    float lastProfit = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    dayPnl       := dayPnl + lastProfit   // accumulate net for consecutive-day tracking
+    sizingCumPnl := sizingCumPnl + lastProfit
+    if sizingCumPnl > sizingPeak
+        sizingPeak := sizingCumPnl
+    if lastProfit >= 0
+        // Win: grow TP target by entry-time ratio, reset consecutive loss count
+        consecLosses := 0
+        dynamicTp    := dynamicTp * entryCompoundRatio
+    else
+        // Loss: shrink TP (floor 1 tick), accumulate daily loss, check halt conditions
+        consecLosses := consecLosses + 1
+        dailyLoss    := dailyLoss + math.abs(lastProfit)
+        dynamicTp    := math.max(dynamicTp / entryCompoundRatio, tickVal)
+        if dailyLoss >= effMaxDaily or consecLosses >= effMaxConsec
+            dailyHalted := true
+    lastExit        := bar_index
+    prevClosedCount := strategy.closedtrades
+    alert(exitMsg, alert.freq_once_per_bar)
+
+// ── Arrows ────────────────────────────────────────────────────────────────────
+plotshape(goLong  and drawArrows, title = "Buy Signal",
+          style = shape.arrowup,   location = location.belowbar,
+          color = upColor, size = size.small)
+plotshape(goShort and drawArrows, title = "Sell Signal",
+          style = shape.arrowdown, location = location.abovebar,
+          color = dnColor, size = size.small)
+
+// ── Swing Lines ───────────────────────────────────────────────────────────────
+if swingHigh and drawLines
+    chart.point hp = chart.point.from_index(st.upBar, st.upHigh)
+    if not na(pivots.low)
+        line.new(pivots.low, hp, color = lineColor, width = lineWt)
+    pivots.high := hp
+
+if swingLow and drawLines
+    chart.point lp = chart.point.from_index(st.downBar, st.downLow)
+    if not na(pivots.high)
+        line.new(pivots.high, lp, color = lineColor, width = lineWt)
+    pivots.low := lp
+
+// ── Warning Label — tick size mismatch ───────────────────────────────────────
+// Fires when any dollar input cannot be expressed as at least one full tick.
+// Trading is blocked until the mismatch is resolved.
+var label warnLabel = na
+if barstate.islast and showWarning
+    if not na(warnLabel)
+        label.delete(warnLabel)
+    string wA = "PARAMETER MISMATCH — ENTRIES BLOCKED"
+    string wB = tpTooSmall  ? "TP $" + str.tostring(dynamicTp, "#.##") + " < 1 tick ($" + str.tostring(tickVal, "#.##") + ") — raise Initial Trade Profit Target" : ""
+    string wC = dlTooNarrow ? "Daily Loss $" + str.tostring(effMaxDaily, "#.##") + " < 1 tick ($" + str.tostring(tickVal, "#.##") + ") — raise Max Daily Loss" : ""
+    string wD = syminfo.ticker + " tick = $" + str.tostring(tickVal, "#.##")
+    warnLabel := label.new(
+         x         = bar_index,
+         y         = high,
+         text      = wA + "\n" + wB + "\n" + wC + "\n" + wD,
+         xloc      = xloc.bar_index,
+         yloc      = yloc.abovebar,
+         style     = label.style_label_down,
+         color     = color.red,
+         textcolor = color.white,
+         size      = size.normal)
+
+// ── Status Label ──────────────────────────────────────────────────────────────
+// Right-edge label showing compounding state, daily risk, window, and R:R.
+// Background turns red when trading is halted for the day.
+var label statusLabel = na
+if barstate.islast and showStatus
+    if not na(statusLabel)
+        label.delete(statusLabel)
+    string haltStr  = consecDayHalted ? " [DAY STREAK HALT " + str.tostring(consecLossDays) + "d]" : dailyHalted ? " [HALTED]" : tpBelowFloor ? " [TP FLOOR]" : (not windowEnabled ? " [WINDOW OFF]" : "")
+    string winStr   = windowEnabled ? winName + "  x" + str.tostring(effWindowRatio, "#.##") : winName + " (disabled)"
+    string rrLStr   = "Long  R:R: " + str.tostring(longRR,  "#.##") + (rrOkLong  ? "" : " [below min]")
+    string rrSStr   = "Short R:R: " + str.tostring(shortRR, "#.##") + (rrOkShort ? "" : " [below min]")
+    string ln1      = "Compounding Machine: " + syminfo.root + haltStr
+    string ln2      = "Day Bias     : " + biasDisplay
+    string ln3      = "TP Target    : $" + str.tostring(dynamicTp, "#.##") + " (" + str.tostring(tpTicks, "#") + " ticks)  floor=$" + str.tostring(minViableTp, "#.##") + (tpBelowFloor ? " ◄ PAUSED" : "")
+    string ln4      = "Daily Loss   : $" + str.tostring(dailyLoss, "#.##") + " / $" + str.tostring(effMaxDaily, "#.##")
+    string ln5      = "Consec Losses: " + str.tostring(consecLosses) + " / " + str.tostring(effMaxConsec) + "   Loss Days: " + str.tostring(consecLossDays) + " / " + str.tostring(maxConsecDays) + (consecDayHalted ? " ◄ HALTED" : "")
+    string ln6      = "Window       : " + winStr
+    string ln7      = rrLStr + "   " + rrSStr
+    string sizingStr = effAutoSize ?
+         "ON  contracts=" + str.tostring(effContracts) + " (base " + str.tostring(contracts) + " +" + str.tostring(sizeExtra) + " extra)" +
+         "  cumPnl=$" + str.tostring(sizingCumPnl, "#.##") +
+         "  peak=$"   + str.tostring(sizingPeak,   "#.##") +
+         "  DD=$"     + str.tostring(sizingDrawdown, "#.##") :
+         "OFF  (fixed " + str.tostring(contracts) + " contract" + (contracts > 1 ? "s)" : ")")
+    string ln8      = "Sizing       : " + sizingStr
+    string apexCfgStr = effUseApex ? " | Apex:" + effApexMode + " len=" + str.tostring(effApexPeriod) + " tf=" + effApexTfInput : ""
+    string autoStr  = autoConfig ? "ON (" + str.tostring(effSwingSize, "#.#") + "x ATR, EMA " + str.tostring(effEmaLen) + ", initTP=$" + str.tostring(effInitTp, "#") + ", maxLoss=$" + str.tostring(effMaxLoss, "#") + apexCfgStr + ")" : "OFF"
+    string ln9      = "Auto-Config  : " + autoStr
+    color lblColor  = (dailyHalted or consecDayHalted) ? color.new(color.red, 20) :
+                      tpBelowFloor ? color.new(color.purple, 20) :
+                      not windowEnabled ? color.new(color.orange, 20) :
+                      effectiveBias == "Bullish" ? color.new(color.green, 30) :
+                      effectiveBias == "Bearish" ? color.new(color.maroon, 20) :
+                      color.new(color.navy, 20)
+    statusLabel := label.new(
+         x         = bar_index,
+         y         = high,
+         text      = ln1 + "\n" + ln2 + "\n" + ln3 + "\n" + ln4 + "\n" + ln5 + "\n" + ln6 + "\n" + ln7 + "\n" + ln8 + "\n" + ln9,
+         xloc      = xloc.bar_index,
+         yloc      = yloc.abovebar,
+         style     = label.style_label_left,
+         color     = lblColor,
+         textcolor = color.white,
+         size      = size.small)
+
+// ── TradersPost Alert Setup ────────────────────────────────────────────────────
+// TRADINGVIEW ALERT SETUP:
+//   1. Click the clock icon -> Create Alert
+//   2. Condition: "Futures Compounding Machine" -> "Any alert() function call"
+//   3. Webhook URL: paste your TradersPost webhook URL
+//   4. Message body: leave blank — the script sends full JSON automatically
+//   5. Set expiry as far out as TradingView allows
+//
+// JSON sent per event (Market Orders ON):
+//   BUY  entry -> action:buy,  sentiment:bullish, quantity:N  (market order)
+//   SELL entry -> action:sell, sentiment:bearish, quantity:N  (market order)
+//   EXIT       -> action:exit  (fires on TP hit, stop, reversal, or EOD)
+//
+// IMPORTANT: TP execution is managed by TradingView's strategy engine.
+// TradersPost receives the entry alert and opens the position in NinjaTrader.
+// The exit alert fires when any close condition is met — ensure webhook
+// delivery is reliable and monitor NinjaTrader fills to confirm each exit.
