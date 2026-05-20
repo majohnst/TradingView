@@ -1,0 +1,165 @@
+//@version=6
+strategy(
+     'dollar-cross-play (NON-REPAINT)',
+     overlay=true,
+     initial_capital=1000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=200,
+     process_orders_on_close=true,
+     pyramiding=0,
+     calc_on_every_tick=false
+)
+
+import TradingView/ta/11
+
+// ─────────────────────────────────────────────
+// Inputs
+// ─────────────────────────────────────────────
+groupSR = "High-Signal S/R Stack"
+
+triggerPrice   = input.float(1.00, "Trigger Price", step=0.01)
+trailPct       = input.float(5.0, "Trailing Stop %", step=0.1) / 100
+
+tpSub          = input.string("", "TraderPost Subscription ID")
+tpQuantity     = input.float(1000, "Dollar Amount / Quantity")
+useDollarQty   = input.bool(true, "Use Dollar Amount (else shares)")
+
+sr_usePivots   = input.bool(true, "Use Daily Pivot", group=groupSR)
+sr_use5DMA     = input.bool(false, "Use True 5-Day MA", group=groupSR)
+
+tpSetTargets   = input.bool(true, "Send TraderPost Limits", group="TraderPost JSON Fields")
+tpTp           = input.float(20.0, "Take Profit TraderPost Signal", step=1.0, minval=2.5, group="TraderPost JSON Fields")
+tpSl           = input.float(5.0, "StopLoss TraderPost Signal", step=1.0, minval=2.5, group="TraderPost JSON Fields")
+
+debugEnabled   = input.bool(true, "Enable debugging")
+
+// ─────────────────────────────────────────────
+// TRUE DAILY DATA (NON-REPAINT)
+// ─────────────────────────────────────────────
+[dO, dH, dL] = request.security(
+    syminfo.tickerid,
+    "D",
+    [open, high, low],
+    barmerge.gaps_off,
+    barmerge.lookahead_off
+)
+
+dailyPivot = (dH + dL + dO) / 3
+
+// ─────────────────────────────────────────────
+// TRUE 5-DAY MA (NON-REPAINT)
+// ─────────────────────────────────────────────
+getTrue5DMA() =>
+    minutesPerDay = 390.0
+    tfMinutes = timeframe.in_seconds() / 60.0
+    barsPerDay = minutesPerDay / tfMinutes
+    len = math.round(barsPerDay * 5)
+    ta.sma(close, len)
+
+ma5d = sr_use5DMA ? getTrue5DMA() : na
+
+// ─────────────────────────────────────────────
+// BIAS LOGIC (CONFIRMED BAR ONLY)
+// ─────────────────────────────────────────────
+abovePivot = not sr_usePivots or close[1] > dailyPivot[1]
+above5DMA  = not sr_use5DMA   or close[1] > ma5d[1]
+
+srBullBias = abovePivot and above5DMA
+
+// ─────────────────────────────────────────────
+// FIXED TRIGGER LEVEL (NO MUTATION)
+// ─────────────────────────────────────────────
+float activeTrigger = sr_usePivots ? dailyPivot : triggerPrice
+
+// NON-REPAINT CROSS
+crossUp = ta.crossover(close[1], activeTrigger[1])
+
+inTrade = strategy.position_size > 0
+
+// ─────────────────────────────────────────────
+// ENTRY (CONFIRMED BAR ONLY)
+// ─────────────────────────────────────────────
+if barstate.isconfirmed and crossUp and not inTrade and srBullBias
+    strategy.entry("Long", strategy.long)
+
+    float enterLimitPrice = math.ceil((close * 100.0)) / 100.0
+
+    entryJson = ''
+    if tpSetTargets
+        entryJson :=
+         '{\n"ticker": "' + syminfo.ticker +
+         '",\n"action": "buy",' +
+         '\n "quantityType": "dollar_amount",' +
+         '\n "quantity": ' + str.tostring(tpQuantity) +
+         ',\n "no_add": true,' +
+         '\n "takeProfit":{\n "percent": ' + str.tostring(tpTp) + '\n },' +
+         '\n "stopLoss":{\n "type": "stop",\n "percent": ' + str.tostring(tpSl) +
+         '},\n"orderType": "limit",' +
+         '\n"limitPrice": '+ str.tostring(enterLimitPrice) + '\n}'
+    else
+        entryJson :=
+         '{\n "ticker": "' + syminfo.ticker +
+         '",\n"action": "buy",' +
+         '\n "quantityType": "dollar_amount",' +
+         '\n "quantity": ' + str.tostring(tpQuantity) +
+         ',\n "no_add": true,' +
+         '\n "orderType": "limit",' +
+         '\n"limitPrice": '+ str.tostring(enterLimitPrice) + '\n}'
+
+    alert(entryJson, alert.freq_once_per_bar_close)
+
+    if debugEnabled
+        log.info(entryJson)
+
+// ─────────────────────────────────────────────
+// TRAILING STOP (LOCKED TO CONFIRMED HIGH)
+// ─────────────────────────────────────────────
+var float highestPrice = na
+
+if inTrade
+    highestPrice := na(highestPrice) ? high[1] : math.max(highestPrice, high[1])
+else
+    highestPrice := na
+
+trailStop = highestPrice * (1 - trailPct)
+
+plot(inTrade ? trailStop : na, "Trailing Stop", color=color.red, linewidth=2)
+
+// ─────────────────────────────────────────────
+// END-OF-DAY EXIT (NON-REPAINT)
+// ─────────────────────────────────────────────
+closeEOD  = input.bool(true, "Force Close at End of Day")
+eodHour   = input.int(15, "EOD Exit Hour (Exchange Time)")
+eodMinute = input.int(58, "EOD Exit Minute")
+
+f_isEODExit() =>
+    eodTime = timestamp(
+        syminfo.timezone,
+        year,
+        month,
+        dayofmonth,
+        eodHour,
+        eodMinute
+    )
+    time >= eodTime
+
+exitCondition = barstate.isconfirmed and inTrade and close[1] <= trailStop
+eodExit = closeEOD and inTrade and f_isEODExit()
+
+if exitCondition or eodExit
+    strategy.close("Long")
+
+    float exitLimitPrice = math.floor((close * 100.0)) / 100.0
+
+    exitJson =
+     '{' +
+     '"ticker": "' + syminfo.ticker + '",' +
+     '\n"action": "exit",' +
+     '\n"orderType": "limit",' +
+     '\n"limitPrice": '+ str.tostring(exitLimitPrice) +
+     '\n}'
+
+    alert(exitJson, alert.freq_once_per_bar_close)
+
+    if debugEnabled
+        log.info(exitJson)
