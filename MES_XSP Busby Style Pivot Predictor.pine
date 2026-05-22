@@ -1,0 +1,96 @@
+//@version=5
+indicator("MES + XSP Busby Pivot (MTF SAFE FIXED)", overlay=true)
+
+//────────────────────────────────────
+// INPUTS
+//────────────────────────────────────
+mesSymbol = input.symbol("CME_MINI:ES1!", "MES / ES Symbol")
+sess      = input.session("0400-0930", "Premarket Session")
+
+weightMES = input.float(0.6, "MES Weight")
+weightXSP = input.float(0.4, "XSP Weight")
+
+//────────────────────────────────────
+// UNIVERSAL SESSION ENGINE (TIME-INDEPENDENT)
+//────────────────────────────────────
+t = time
+
+isPremarket = session.ismarket == false and session.ispremarket
+
+newSession = isPremarket and not isPremarket[1]
+
+//────────────────────────────────────
+// XSP PREMARKET RANGE (ROBUST)
+//────────────────────────────────────
+var float xspHigh = na
+var float xspLow  = na
+
+if newSession
+    xspHigh := high
+    xspLow  := low
+else if isPremarket
+    xspHigh := math.max(nz(xspHigh, high), high)
+    xspLow  := math.min(nz(xspLow, low), low)
+
+//────────────────────────────────────
+// MES (HIGHER TF ANCHOR — STABLE)
+//────────────────────────────────────
+mesHigh  = request.security(mesSymbol, "15", high)
+mesLow   = request.security(mesSymbol, "15", low)
+mesClose = request.security(mesSymbol, "15", close)
+
+// fallback safety
+mesHigh := nz(mesHigh, mesClose)
+mesLow  := nz(mesLow, mesClose)
+mesClose:= nz(mesClose, close)
+
+//────────────────────────────────────
+// PIVOTS (STABLE)
+//────────────────────────────────────
+xspPivot = (nz(xspHigh, close) + nz(xspLow, close) + close) / 3
+mesPivot = (mesHigh + mesLow + mesClose) / 3
+
+rawPivot =
+     mesPivot * weightMES +
+     xspPivot * weightXSP
+
+//────────────────────────────────────
+// SESSION LOCK (CRITICAL FIX)
+//────────────────────────────────────
+var float lockedPivot = na
+
+if newSession
+    lockedPivot := rawPivot
+
+lockedPivot := nz(lockedPivot, close)
+
+//────────────────────────────────────
+// RANGE
+//────────────────────────────────────
+busbyRange = math.max(nz(xspHigh - xspLow, syminfo.mintick), syminfo.mintick)
+
+//────────────────────────────────────
+// LEVELS
+//────────────────────────────────────
+u1 = lockedPivot + busbyRange * 0.25
+u2 = lockedPivot + busbyRange * 0.50
+l1 = lockedPivot - busbyRange * 0.25
+l2 = lockedPivot - busbyRange * 0.50
+
+//────────────────────────────────────
+// PLOTS
+//────────────────────────────────────
+plot(lockedPivot, "Pivot", color=color.yellow, linewidth=2)
+
+plot(u1, "U1", color=color.green)
+plot(u2, "U2", color=color.green)
+plot(l1, "L1", color=color.red)
+plot(l2, "L2", color=color.red)
+
+//────────────────────────────────────
+// BIAS
+//────────────────────────────────────
+bull = close > lockedPivot
+bear = close < lockedPivot
+
+bgcolor(bull ? color.new(color.green, 90) : bear ? color.new(color.red, 90) : na)
