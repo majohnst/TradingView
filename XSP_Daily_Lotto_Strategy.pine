@@ -529,10 +529,10 @@ plot(isMkt ? bearTrigger : na, "Bear Trigger (put fill zone)",  color=color.new(
 
 // Option-price TP levels — where the underlying must be for the option to hit T1/T2 value.
 // These are the ACTUAL exit triggers.  The gamma proxy lines above are structural reference only.
-plot(isMkt ? lockedLow  + tp1OptionPrice : na, "Call TP1 ($" + str.tostring(tp1OptionPrice, "#.##") + ")", color=color.new(color.green,  40), linewidth=1, style=plot.style_linebr)
-plot(isMkt ? lockedLow  + tp2OptionPrice : na, "Call TP2 ($" + str.tostring(tp2OptionPrice, "#.##") + ")", color=color.new(color.green,  10), linewidth=2, style=plot.style_linebr)
-plot(isMkt ? lockedHigh - tp1OptionPrice : na, "Put  TP1 ($" + str.tostring(tp1OptionPrice, "#.##") + ")", color=color.new(color.red,    40), linewidth=1, style=plot.style_linebr)
-plot(isMkt ? lockedHigh - tp2OptionPrice : na, "Put  TP2 ($" + str.tostring(tp2OptionPrice, "#.##") + ")", color=color.new(color.red,    10), linewidth=2, style=plot.style_linebr)
+plot(isMkt ? lockedLow  + tp1OptionPrice : na, "Call TP1", color=color.new(color.green,  40), linewidth=1, style=plot.style_linebr)
+plot(isMkt ? lockedLow  + tp2OptionPrice : na, "Call TP2", color=color.new(color.green,  10), linewidth=2, style=plot.style_linebr)
+plot(isMkt ? lockedHigh - tp1OptionPrice : na, "Put  TP1", color=color.new(color.red,    40), linewidth=1, style=plot.style_linebr)
+plot(isMkt ? lockedHigh - tp2OptionPrice : na, "Put  TP2", color=color.new(color.red,    10), linewidth=2, style=plot.style_linebr)
 
 bgcolor(close > lockedPivot ? color.new(color.green, 93) : close < lockedPivot ? color.new(color.red, 93) : na)
 
