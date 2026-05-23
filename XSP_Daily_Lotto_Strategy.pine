@@ -129,8 +129,13 @@ float stopMult  = input.float(1.0, "Stop (× T1 extension past PM level)",
     tooltip = "Stop placed N × the T1 extension distance on the adverse side of the entry PM level.  " +
               "1.0 = stop at T1↓ for bull call (same distance below PM_LOW as T1 is above PM_HIGH).",
     group   = GRP_EXIT)
-int   eodHr     = input.int(15, "EOD force-close hour (NY)",   minval = 12, maxval = 15, group = GRP_EXIT)
-int   eodMn     = input.int(45, "EOD force-close minute (NY)", minval = 0,  maxval = 59, group = GRP_EXIT)
+bool  eodEn     = input.bool(true, "EOD force-close",
+    tooltip = "ON: strategy closes any open position at the time below.  " +
+              "OFF: position is left to expire (option goes worthless) — avoids the broker close fee and does not consume a day trade.  " +
+              "Turn OFF when the trade is clearly a loser and paying to close costs more than letting it expire worthless.",
+    group   = GRP_EXIT)
+int   eodHr     = input.int(15, "  EOD force-close hour (NY)",   minval = 12, maxval = 15, group = GRP_EXIT)
+int   eodMn     = input.int(45, "  EOD force-close minute (NY)", minval = 0,  maxval = 59, group = GRP_EXIT)
 
 // ── Session ───────────────────────────────────────────────────────────────────
 int entryLockHr = input.int(11, "No new entries after hour (NY)",
@@ -381,7 +386,8 @@ if strategy.position_size < 0
         strategy.exit("Short Stop", from_entry="Short", stop=sl, comment_loss="Stop")
 
 // ── EOD Force-Close ───────────────────────────────────────────────────────────
-if isEod and strategy.position_size != 0
+// When eodEn is OFF the position is left to expire — no close fee, no day trade.
+if eodEn and isEod and strategy.position_size != 0
     strategy.close_all(comment = "EOD")
     alert(exitJson, alert.freq_once_per_bar)
 
@@ -459,7 +465,8 @@ if barstate.islast and showStatus
     string ln4  = "Spike req: " + spkS + " pt  |  max cost: $" + str.tostring(maxPremium, "#.##") + "  @  $" + str.tostring(costPerPt, "#.##") + "/pt"
     string ln5  = "T1/T2 bull: " + str.tostring(t1up, "#.##") + " / " + str.tostring(t2up, "#.##") + "   bear: " + str.tostring(t1dn, "#.##") + " / " + str.tostring(t2dn, "#.##")
     string ln6  = "OR: " + orS + "   Stop mult: " + str.tostring(stopMult, "#.##") + "×"
-    string ln7  = "Window: " + (inWindow ? "OPEN" : afterLock ? "locked (entry cutoff)" : isEod ? "EOD close active" : "outside session")
+    string eodStr = eodEn ? "force-close @ " + str.tostring(eodHr) + ":" + (eodMn < 10 ? "0" : "") + str.tostring(eodMn) + " NY" : "OFF (let expire)"
+    string ln7  = "Window: " + (inWindow ? "OPEN" : afterLock ? "locked (entry cutoff)" : isEod ? "EOD zone" : "outside session") + "   EOD: " + eodStr
     color  sCol = isBull ? color.new(color.green, 30) : isBear ? color.new(color.maroon, 20) : color.new(color.navy, 20)
     statusLabel := label.new(bar_index, high, ln1 + "\n" + ln2 + "\n" + ln3 + "\n" + ln4 + "\n" + ln5 + "\n" + ln6 + "\n" + ln7, xloc=xloc.bar_index, yloc=yloc.abovebar, style=label.style_label_left, color=sCol, textcolor=color.white, size=size.small)
 
@@ -474,7 +481,7 @@ if barstate.islast and showStatus
 // JSON sent (Market Orders ON):
 //   BUY  entry → action:buy,  sentiment:bullish, optionType:call, strike:NNN, expiry:0DTE
 //   SELL entry → action:sell, sentiment:bearish, optionType:put,  strike:NNN, expiry:0DTE
-//   EXIT       → action:exit  (fires on TP1, TP2, stop, or EOD close)
+//   EXIT       → action:exit  (fires on TP1, TP2, stop, or EOD close when EOD enabled)
 //
 // NOTE: TradersPost option support varies by broker integration. The strike
 // and optionType fields are included as metadata. Verify your broker's webhook
