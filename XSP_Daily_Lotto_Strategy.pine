@@ -129,6 +129,25 @@ float stopMult  = input.float(1.0, "Stop (× T1 extension past PM level)",
     tooltip = "Stop placed N × the T1 extension distance on the adverse side of the entry PM level.  " +
               "1.0 = stop at T1↓ for bull call (same distance below PM_LOW as T1 is above PM_HIGH).",
     group   = GRP_EXIT)
+bool  itmCheckEn  = input.bool(true, "Close if ITM before expiry",
+    tooltip = "At the configured minutes-before-EOD window, checks if the open position is ITM.  " +
+              "If it is — and not deep-ITM on a cash-settled instrument — closes for whatever intrinsic value remains.  " +
+              "Prevents a modestly-profitable position from expiring worthless when TP targets were never reached.",
+    group   = GRP_EXIT)
+int   itmOffset   = input.int(30, "  Minutes before EOD to check",
+    minval  = 5, maxval = 60,
+    tooltip = "How many minutes before the EOD force-close time to run the ITM check.  Default 30 = check at 3:15 when EOD is 3:45.",
+    group   = GRP_EXIT)
+bool  skipDeepItm = input.bool(true, "  Skip close if deep ITM (cash-settled hold)",
+    tooltip = "ON: if the position is deeply ITM (beyond the threshold below), skip the ITM close and let it settle.  " +
+              "XSP and SPX are European cash-settled — no assignment risk, so holding a way-ITM option to expiry is safe.  " +
+              "OFF: always close at the check window if ITM, regardless of depth.",
+    group   = GRP_EXIT)
+float deepItmPts  = input.float(2.0, "  Deep ITM threshold (points)",
+    minval  = 0.5, step = 0.5,
+    tooltip = "Position is considered deep ITM when the underlying is this many points past the strike.  " +
+              "At 1-pt snap grid, 2 pts = 2 strikes deep ITM.  Raise for higher-ATR instruments.",
+    group   = GRP_EXIT)
 bool  eodEn     = input.bool(true, "EOD force-close",
     tooltip = "ON: strategy closes any open position at the time below.  " +
               "OFF: position is left to expire (option goes worthless) — avoids the broker close fee and does not consume a day trade.  " +
@@ -168,9 +187,10 @@ bool mktOpen = bar_index > 0 and isMkt and not isMkt[1]
 bool orEnds  = bar_index > 0 and not isOR and isOR[1] and isMkt
 bool newDay  = ta.change(time("D")) != 0
 
-bool afterLock = nyH > entryLockHr or (nyH == entryLockHr and nyM >= entryLockMn)
-bool isEod     = nyH > eodHr or (nyH == eodHr and nyM >= eodMn)
-bool inWindow  = isMkt and not afterLock and not isEod
+bool afterLock      = nyH > entryLockHr or (nyH == entryLockHr and nyM >= entryLockMn)
+bool isEod          = nyH > eodHr or (nyH == eodHr and nyM >= eodMn)
+bool inWindow       = isMkt and not afterLock and not isEod
+bool isItmCheckTime = isMkt and nyMin >= (eodHr * 60 + eodMn - itmOffset) and not isEod
 
 // ── Premarket Range (chart symbol) ───────────────────────────────────────────
 var float pmHigh  = na
@@ -296,11 +316,13 @@ float bullTrigger = lockedLow  - minSpike   // spike-down target (call entry)
 float bearTrigger = lockedHigh + minSpike   // spike-up target (put entry)
 
 // ── Daily Trade Counter ───────────────────────────────────────────────────────
-var int bullCount = 0
-var int bearCount = 0
+var int  bullCount    = 0
+var int  bearCount    = 0
+var bool itmCheckFired = false
 if newDay
-    bullCount := 0
-    bearCount := 0
+    bullCount     := 0
+    bearCount     := 0
+    itmCheckFired := false
 
 // ── Direction Gate ────────────────────────────────────────────────────────────
 // "Both" mode: bull sentiment = calls only; bear = puts only; neutral = either.
@@ -385,6 +407,29 @@ if strategy.position_size < 0
     else if stopEn and not na(sl)
         strategy.exit("Short Stop", from_entry="Short", stop=sl, comment_loss="Stop")
 
+// ── ITM-30 Check ─────────────────────────────────────────────────────────────
+// Runs once per day when the check window opens (default 30 min before EOD).
+// Purpose: capture remaining intrinsic value when TP targets were never reached.
+//
+// Close decision matrix:
+//   OTM          → skip (let expire worthless — EOD toggle handles this)
+//   ITM, shallow → close to capture value and avoid wasting the fill
+//   ITM, deep    → skip close when skipDeepItm ON (cash-settled, no assignment risk)
+//
+// "Deep ITM" = underlying is ≥ deepItmPts points past the strike.  On a
+// cash-settled instrument (XSP, SPX) holding a way-ITM option to expiry is safe
+// — no shares delivered, settles to intrinsic at the 4 PM fixing price.
+
+float itmDepth = strategy.position_size > 0 and not na(entryStrk) ? close - entryStrk : strategy.position_size < 0 and not na(entryStrk) ? entryStrk - close : 0.0
+bool  posIsItm = itmDepth > 0.0
+
+if itmCheckEn and isItmCheckTime and not itmCheckFired and strategy.position_size != 0
+    itmCheckFired := true
+    bool holdForCash = skipDeepItm and itmDepth >= deepItmPts
+    if posIsItm and not holdForCash
+        strategy.close_all(comment = "ITM-30")
+        alert(exitJson, alert.freq_once_per_bar)
+
 // ── EOD Force-Close ───────────────────────────────────────────────────────────
 // When eodEn is OFF the position is left to expire — no close fee, no day trade.
 if eodEn and isEod and strategy.position_size != 0
@@ -465,10 +510,15 @@ if barstate.islast and showStatus
     string ln4  = "Spike req: " + spkS + " pt  |  max cost: $" + str.tostring(maxPremium, "#.##") + "  @  $" + str.tostring(costPerPt, "#.##") + "/pt"
     string ln5  = "T1/T2 bull: " + str.tostring(t1up, "#.##") + " / " + str.tostring(t2up, "#.##") + "   bear: " + str.tostring(t1dn, "#.##") + " / " + str.tostring(t2dn, "#.##")
     string ln6  = "OR: " + orS + "   Stop mult: " + str.tostring(stopMult, "#.##") + "×"
-    string eodStr = eodEn ? "force-close @ " + str.tostring(eodHr) + ":" + (eodMn < 10 ? "0" : "") + str.tostring(eodMn) + " NY" : "OFF (let expire)"
+    string eodStr  = eodEn ? "force-close @ " + str.tostring(eodHr) + ":" + (eodMn < 10 ? "0" : "") + str.tostring(eodMn) + " NY" : "OFF (let expire)"
+    int    itmH    = (eodHr * 60 + eodMn - itmOffset) / 60
+    int    itmM    = (eodHr * 60 + eodMn - itmOffset) % 60
+    string itmTimeStr = str.tostring(itmH) + ":" + (itmM < 10 ? "0" : "") + str.tostring(itmM)
+    string itmStatus = not itmCheckEn ? "OFF" : itmCheckFired ? (posIsItm ? "CLOSED ITM (" + str.tostring(itmDepth, "#.##") + "pt)" : "checked — OTM (held)") : "armed @ " + itmTimeStr + " NY"
     string ln7  = "Window: " + (inWindow ? "OPEN" : afterLock ? "locked (entry cutoff)" : isEod ? "EOD zone" : "outside session") + "   EOD: " + eodStr
+    string ln8  = "ITM-30: " + itmStatus + (skipDeepItm ? "   deep-ITM hold ≥ " + str.tostring(deepItmPts, "#.##") + "pt" : "")
     color  sCol = isBull ? color.new(color.green, 30) : isBear ? color.new(color.maroon, 20) : color.new(color.navy, 20)
-    statusLabel := label.new(bar_index, high, ln1 + "\n" + ln2 + "\n" + ln3 + "\n" + ln4 + "\n" + ln5 + "\n" + ln6 + "\n" + ln7, xloc=xloc.bar_index, yloc=yloc.abovebar, style=label.style_label_left, color=sCol, textcolor=color.white, size=size.small)
+    statusLabel := label.new(bar_index, high, ln1 + "\n" + ln2 + "\n" + ln3 + "\n" + ln4 + "\n" + ln5 + "\n" + ln6 + "\n" + ln7 + "\n" + ln8, xloc=xloc.bar_index, yloc=yloc.abovebar, style=label.style_label_left, color=sCol, textcolor=color.white, size=size.small)
 
 // ── TradersPost Alert Setup ────────────────────────────────────────────────────
 // ALERT SETUP:
