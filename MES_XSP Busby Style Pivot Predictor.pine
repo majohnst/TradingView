@@ -1,0 +1,189 @@
+//@version=5
+indicator("MES + XSP Busby Pivot", overlay=true, max_boxes_count=20, max_labels_count=50)
+
+//─── INPUTS ───────────────────────────────────────────────────────────────────
+mesSymbol   = input.symbol("CME_MINI:ES1!", "MES / ES Symbol")
+snapEnabled = input.bool(true,  "Snap levels to nearest option strike")
+sentThresh  = input.float(0.10, "MES neutral band (%)", minval=0.0, maxval=1.0, step=0.05) / 100
+lvl1Mult    = input.float(0.25, "Level 1 multiplier",   minval=0.05, step=0.05)
+lvl2Mult    = input.float(0.50, "Level 2 multiplier",   minval=0.05, step=0.05)
+showOR      = input.bool(true,  "Show Opening Range box")
+orMins      = input.int(15,     "Opening Range (minutes)", options=[5, 10, 15, 30])
+showLabels  = input.bool(true,  "Show open label + entry reference")
+
+//─── TIME-BASED SESSION DETECTION ─────────────────────────────────────────────
+nyMins  = hour(time, "America/New_York") * 60 + minute(time, "America/New_York")
+isPM    = nyMins >= 240 and nyMins < 570
+isMkt   = nyMins >= 570 and nyMins < 960
+isOR    = isMkt and nyMins < (570 + orMins)
+pmStart = bar_index > 0 and isPM  and not isPM[1]
+mktOpen = bar_index > 0 and isMkt and not isMkt[1]
+orEnds  = bar_index > 0 and not isOR and isOR[1] and isMkt
+
+//─── XSP PREMARKET RANGE ACCUMULATION ─────────────────────────────────────────
+var float pmHigh  = na
+var float pmLow   = na
+var float pmClose = na
+
+if pmStart
+    pmHigh  := high
+    pmLow   := low
+    pmClose := close
+else if isPM
+    pmHigh  := math.max(nz(pmHigh, high), high)
+    pmLow   := math.min(nz(pmLow,  low),  low)
+    pmClose := close
+
+//─── MES PREMARKET RANGE (futures trade 23/7 — reliable source when XSP has no PM bars) ──
+// XSP is a CBOE derived index and may have no premarket bars on TradingView.
+// MES futures have data from Sunday 6 PM through Friday 5 PM.
+// Accumulate MES 15-min H/L during the premarket window, then scale to XSP
+// units at market open using the live XSP/MES price ratio.
+mesHighPM  = nz(request.security(mesSymbol, "15", high),  close)
+mesLowPM   = nz(request.security(mesSymbol, "15", low),   close)
+mesClosePM = nz(request.security(mesSymbol, "15", close), close)
+
+var float mesPmHigh  = na
+var float mesPmLow   = na
+var float mesPmClose = na
+
+if pmStart
+    mesPmHigh  := mesHighPM
+    mesPmLow   := mesLowPM
+    mesPmClose := mesClosePM
+else if isPM
+    mesPmHigh  := math.max(nz(mesPmHigh,  mesHighPM),  mesHighPM)
+    mesPmLow   := math.min(nz(mesPmLow,   mesLowPM),   mesLowPM)
+    mesPmClose := mesClosePM
+
+//─── OPENING RANGE ACCUMULATION ───────────────────────────────────────────────
+var float orHigh     = na
+var float orLow      = na
+var int   orStartBar = na
+
+if mktOpen
+    orHigh     := high
+    orLow      := low
+    orStartBar := bar_index
+else if isOR
+    orHigh := math.max(nz(orHigh, high), high)
+    orLow  := math.min(nz(orLow,  low),  low)
+
+//─── MES SENTIMENT ────────────────────────────────────────────────────────────
+mesCloseNow = nz(request.security(mesSymbol, "15", close), close)
+mesD_C      = nz(request.security(mesSymbol, "D",  close[1]), mesCloseNow)
+mesPct      = mesD_C > 0 ? (mesCloseNow - mesD_C) / mesD_C : 0.0
+isBull      = mesPct >  sentThresh
+isBear      = mesPct < -sentThresh
+
+sentFill   = isBull ? color.new(color.green, 85) : isBear ? color.new(color.red, 85) : color.new(color.yellow, 85)
+sentBorder = isBull ? color.green : isBear ? color.red : color.yellow
+sentText   = isBull ? "BULL" : isBear ? "BEAR" : "NEUTRAL"
+
+//─── PRIOR DAY XSP (last-resort fallback) ────────────────────────────────────
+xspD_H = nz(request.security(syminfo.tickerid, "D", high[1]),  close)
+xspD_L = nz(request.security(syminfo.tickerid, "D", low[1]),   close)
+xspD_C = nz(request.security(syminfo.tickerid, "D", close[1]), close)
+
+//─── STRIKE SNAP ──────────────────────────────────────────────────────────────
+xspATR  = nz(request.security(syminfo.tickerid, "D", ta.atr(14)), 5.0)
+snapInt = xspATR < 4.0 ? 0.5 : xspATR < 8.0 ? 1.0 : xspATR < 15.0 ? 2.5 : 5.0
+snap(v) => snapEnabled ? math.round(v / snapInt) * snapInt : v
+
+//─── PREMARKET BOX ────────────────────────────────────────────────────────────
+var box pmBox = na
+
+if pmStart
+    box.delete(pmBox)
+    pmBox := box.new(bar_index, high, bar_index + 1, low, bgcolor=sentFill, border_color=sentBorder, border_width=1)
+
+if (isPM or isMkt) and not na(pmBox)
+    box.set_top(pmBox,          nz(pmHigh, high))
+    box.set_bottom(pmBox,       nz(pmLow,  low))
+    box.set_right(pmBox,        bar_index + 1)
+    box.set_bgcolor(pmBox,      sentFill)
+    box.set_border_color(pmBox, sentBorder)
+
+//─── OPENING RANGE BOX ────────────────────────────────────────────────────────
+var box orBox = na
+
+if orEnds and showOR
+    box.delete(orBox)
+    orFill   = isBull ? color.new(color.teal, 80) : isBear ? color.new(color.maroon, 80) : color.new(color.gray, 80)
+    orBorder = isBull ? color.teal : isBear ? color.maroon : color.gray
+    orBox := box.new(nz(orStartBar, bar_index), nz(orHigh, high), bar_index, nz(orLow, low), bgcolor=orFill, border_color=orBorder, border_width=1, border_style=line.style_dashed)
+
+//─── LOCK LEVELS AT 9:30 AM ───────────────────────────────────────────────────
+// Level structure anchored to PM HIGH and PM LOW, not the pivot midpoint.
+//
+//   T2↑ = PM_HIGH + range × lvl2Mult  ← bull ladder target 2
+//   T1↑ = PM_HIGH + range × lvl1Mult  ← bull ladder target 1
+//   PM HIGH ─────────────────────────── call breakout / put entry ref
+//   Pivot   (H+L+C)/3 ─────────────────  midpoint / bias reference
+//   PM LOW  ─────────────────────────── put breakdown / call entry ref
+//   T1↓ = PM_LOW  − range × lvl1Mult  ← bear ladder target 1
+//   T2↓ = PM_LOW  − range × lvl2Mult  ← bear ladder target 2
+//
+// When XSP has no premarket bars (CBOE index), MES premarket range is used,
+// scaled to XSP units via the live price ratio.  Prior day is the last resort.
+
+var float lockedPivot = na
+var float lockedHigh  = na
+var float lockedLow   = na
+var float lockedRange = na
+
+if mktOpen
+    // Prefer XSP premarket; fall back to MES-derived range; then prior day
+    hasXSP = not na(pmHigh) and pmHigh > nz(pmLow, pmHigh)
+    hasMES = not na(mesPmHigh) and mesPmHigh > nz(mesPmLow, mesPmHigh)
+
+    mesScale = mesClosePM > 0 ? close / mesClosePM : 1.0
+
+    h = hasXSP ? pmHigh : hasMES ? mesPmHigh * mesScale : xspD_H
+    l = hasXSP ? pmLow  : hasMES ? mesPmLow  * mesScale : xspD_L
+    c = hasXSP ? pmClose : hasMES ? close : xspD_C
+
+    lockedPivot := snap((h + l + c) / 3)
+    lockedHigh  := snap(h)
+    lockedLow   := snap(l)
+    lockedRange  := h - l
+
+lockedPivot := nz(lockedPivot, snap((xspD_H + xspD_L + xspD_C) / 3))
+lockedHigh  := nz(lockedHigh,  snap(xspD_H))
+lockedLow   := nz(lockedLow,   snap(xspD_L))
+lockedRange  := math.max(nz(lockedRange, xspD_H - xspD_L), syminfo.mintick)
+
+//─── GAMMA PROXY LEVELS (extensions beyond the box) ───────────────────────────
+t2up = snap(lockedHigh + lockedRange * lvl2Mult)
+t1up = snap(lockedHigh + lockedRange * lvl1Mult)
+t1dn = snap(lockedLow  - lockedRange * lvl1Mult)
+t2dn = snap(lockedLow  - lockedRange * lvl2Mult)
+
+//─── MARKET OPEN LABEL ────────────────────────────────────────────────────────
+var label openLabel = na
+
+if mktOpen and showLabels
+    label.delete(openLabel)
+    entryRef  = isBull ? lockedLow : lockedHigh
+    entryDir  = isBull ? "CALL entry ref" : isBear ? "PUT entry ref" : "Entry ref"
+    t1Val     = isBull ? t1up : t1dn
+    t2Val     = isBull ? t2up : t2dn
+    line1     = sentText + " | Pivot: " + str.tostring(lockedPivot, "#.##")
+    line2     = entryDir + ": " + str.tostring(entryRef, "#.##")
+    line3     = "T1: " + str.tostring(t1Val, "#.##") + "   T2: " + str.tostring(t2Val, "#.##")
+    labelText = line1 + "\n" + line2 + "\n" + line3
+    labelCol  = isBull ? color.green : isBear ? color.red : color.orange
+    labelTxt  = isBull ? color.white : isBear ? color.white : color.black
+    openLabel := label.new(bar_index, lockedHigh, labelText, color=labelCol, textcolor=labelTxt, style=label.style_label_down, size=size.small)
+
+//─── PLOTS ────────────────────────────────────────────────────────────────────
+plot(t2up,        "T2 ↑",  color=color.green,                linewidth=2)
+plot(t1up,        "T1 ↑",  color=color.new(color.green, 30))
+plot(lockedHigh,  "PM H",  color=color.new(color.aqua,  20), linewidth=1)
+plot(lockedPivot, "Pivot", color=color.yellow,               linewidth=2)
+plot(lockedLow,   "PM L",  color=color.new(color.aqua,  20), linewidth=1)
+plot(t1dn,        "T1 ↓",  color=color.new(color.red,   30))
+plot(t2dn,        "T2 ↓",  color=color.red,                  linewidth=2)
+
+bgCol = close > lockedPivot ? color.new(color.green, 93) : close < lockedPivot ? color.new(color.red, 93) : na
+bgcolor(bgCol)
