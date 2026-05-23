@@ -10,14 +10,14 @@
 //    BULL day:  BTO CALL at snap(orHigh) — the OR top strike.
 //               Entry fires when price PULLS BACK to orLow (OR bottom).
 //               Expected: OR breakout resumes upward after the pullback fills.
-//               TP1 = orHigh + (maxPremium × tp1PremMult)  cost-recovery; 3× $0.10 = $0.30/share
-//               TP2 = orHigh + tp2OptionPrice               profit runner; fixed $1.50/share
+//               TP1 = orHigh + tp1OptionPrice   (e.g. $1.00 — underlying $1 past OR strike)
+//               TP2 = orHigh + tp2OptionPrice   (e.g. $1.50 — profit runner)
 //               Stop = orHigh (call ATM = 0 intrinsic for 0DTE)
 //
 //    BEAR day:  BTO PUT at snap(orLow) — the OR bottom strike.
 //               Entry fires when price SPIKES UP to orHigh (OR top).
 //               Expected: false pop fades back through the OR range.
-//               TP1 = orLow − (maxPremium × tp1PremMult)
+//               TP1 = orLow − tp1OptionPrice
 //               TP2 = orLow − tp2OptionPrice
 //               Stop = orLow (put ATM)
 //
@@ -113,20 +113,17 @@ int optMultiplier = input.int(100, "Contract multiplier (shares per contract)",
     minval  = 1,
     tooltip = "Standard US options = 100.  Mini options may differ.",
     group   = GRP_OR)
-float tp1PremMult = input.float(5.0, "TP1 exit — multiples of premium paid",
-    minval  = 1.0, maxval = 20.0, step = 0.5,
-    tooltip = "T1 fires when the option is worth this multiple of what you paid.  " +
-              "5× at $0.10 premium → $0.50 option value; underlying needs to move $0.40/share past the OR strike.  " +
-              "Scales automatically with the max premium input — change premium and T1 re-prices itself.  " +
-              "Lower values fire more often (smaller wins); higher = fewer but larger T1 wins.  " +
-              "At defaults: 5× $0.10 = $0.50 TP1, $1.50 TP2 → 1:3 ratio.  3× tested (too small); 10× is original $1.00 target.",
-    group   = GRP_OR)
-float tp2OptionPrice = input.float(1.50, "TP2 option price target ($) — fixed runner",
+float tp1OptionPrice = input.float(1.00, "TP1 option price target ($)",
     minval  = 0.05, step = 0.05,
-    tooltip = "Option value per share at T2 — this is a fixed price, not a multiplier.  " +
-              "Underlying must reach $1.50 past the OR boundary strike.  " +
-              "At default premium $0.10: T1 = $0.30 (3×), T2 = $1.50 (15×) — 1:5 ratio.  " +
-              "If you raise the premium input, T1 scales but T2 stays fixed; adjust T2 manually to maintain the ratio.",
+    tooltip = "Option value per share at T1.  Underlying must reach this many dollars past the OR strike.  " +
+              "$1.00 default: underlying moves $1 past orHigh (calls) or $1 below orLow (puts).  " +
+              "Busby PM_HIGH typically sits ~$1 above orHigh — validates this as the natural first target.  " +
+              "Backtesting showed $1.00 generates 5.8× more P&L than $0.50 over the same period.",
+    group   = GRP_OR)
+float tp2OptionPrice = input.float(1.50, "TP2 option price target ($)",
+    minval  = 0.05, step = 0.05,
+    tooltip = "Option value per share at T2.  Underlying must reach $1.50 past the OR boundary strike.  " +
+              "$0.50 gap above T1 gives the runner room without requiring extreme continuation moves.",
     group   = GRP_OR)
 int maxPerDir = input.int(1, "Max entries per direction per day",
     minval  = 1, maxval = 3,
@@ -213,13 +210,6 @@ string alertFmt = input.string("Toast", "Alert format",
 // ── Visuals ───────────────────────────────────────────────────────────────────
 bool showLabels = input.bool(true, "Show OR label",     group = GRP_VIS)
 bool showStatus = input.bool(true, "Show status label", group = GRP_VIS)
-
-// ── Derived Parameters ────────────────────────────────────────────────────────
-// tp1OptionPrice is NOT an input — it derives from the premium multiplier so it
-// automatically re-scales whenever maxPremium changes.
-//   $0.10 prem × 5.0 = $0.50/share  →  net +$40/contract at T1
-//   $0.05 prem × 5.0 = $0.25/share  →  net +$20/contract at T1
-float tp1OptionPrice = maxPremium * tp1PremMult
 
 // ── Time Helpers (New York) ───────────────────────────────────────────────────
 int  nyH   = hour(time, "America/New_York")
@@ -594,9 +584,8 @@ if orEnds and showLabels
     string pT1      = str.tostring(snap(orLowRef)  - tp1OptionPrice, "#.##")
     string pT2      = str.tostring(snap(orLowRef)  - tp2OptionPrice, "#.##")
     string ln1 = sentText + "  |  Pivot: " + str.tostring(lockedPivot, "#.##") + "  OR: [" + orLStr + " – " + orHStr + "]  max $" + str.tostring(maxPremium, "#.##")
-    string tp1Lbl = "$" + str.tostring(tp1OptionPrice, "#.##") + " = " + str.tostring(tp1PremMult, "#.#") + "x prem"
-    string ln2 = "BULL CALL@" + callStrk + "  trigger pull-back <= " + orLStr + "  TP1@" + cT1 + " (" + tp1Lbl + ")  TP2@" + cT2 + " ($" + str.tostring(tp2OptionPrice, "#.##") + ")"
-    string ln3 = "BEAR PUT@"  + putStrk  + "  trigger spike    >= " + orHStr + "  TP1@" + pT1 + " (" + tp1Lbl + ")  TP2@" + pT2 + " ($" + str.tostring(tp2OptionPrice, "#.##") + ")"
+    string ln2 = "BULL CALL@" + callStrk + "  trigger pull-back <= " + orLStr + "  TP1@" + cT1 + " ($" + str.tostring(tp1OptionPrice, "#.##") + ")  TP2@" + cT2 + " ($" + str.tostring(tp2OptionPrice, "#.##") + ")"
+    string ln3 = "BEAR PUT@"  + putStrk  + "  trigger spike    >= " + orHStr + "  TP1@" + pT1 + " ($" + str.tostring(tp1OptionPrice, "#.##") + ")  TP2@" + pT2 + " ($" + str.tostring(tp2OptionPrice, "#.##") + ")"
     string ln4 = "NEUTRAL CALL/PUT@" + pivStr + "  first OR touch  |  TP1/TP2: $" + str.tostring(neutTp1Price, "#.##") + " / $" + str.tostring(neutTp2Price, "#.##")
     color  lc  = isBull ? color.green : isBear ? color.red : color.orange
     string labelTxt = neutralEn ? ln1 + "\n" + ln2 + "\n" + ln3 + "\n" + ln4 : ln1 + "\n" + ln2 + "\n" + ln3
@@ -649,7 +638,7 @@ if barstate.islast and showStatus
     string ln3 = "PUT@"  + pStrk + "  trigger: spike    ≥ " + orHStr2 + "  |  " + eFired
     string ln4 = "NEUTRAL@" + str.tostring(snap(lockedPivot), "#.##") + "  first OR touch  |  " + nFired
     string ln5 = str.tostring(dirContracts) + " dir contracts ($" + str.tostring(maxRiskDollars, "#") + " risk)  |  " + str.tostring(neutContracts) + " neut contracts ($" + str.tostring(neutRiskDollars, "#") + " risk)"
-    string ln6 = "P&L: loss=$-" + str.tostring(maxLoss, "#") + "  TP1=$+" + str.tostring(tp1Gain, "#") + " (" + str.tostring(tp1PremMult, "#.#") + "x prem = $" + str.tostring(tp1OptionPrice, "#.##") + ")  TP2=$+" + str.tostring(tp2Gain, "#") + " ($" + str.tostring(tp2OptionPrice, "#.##") + ")  full=$+" + str.tostring(fullWin, "#")
+    string ln6 = "P&L: loss=$-" + str.tostring(maxLoss, "#") + "  TP1=$+" + str.tostring(tp1Gain, "#") + " ($" + str.tostring(tp1OptionPrice, "#.##") + ")  TP2=$+" + str.tostring(tp2Gain, "#") + " ($" + str.tostring(tp2OptionPrice, "#.##") + ")  full=$+" + str.tostring(fullWin, "#")
     string eodStr   = eodEn ? "force-close @ " + str.tostring(eodHr) + ":" + (eodMn < 10 ? "0" : "") + str.tostring(eodMn) + " NY" : "OFF (let expire)"
     int    itmH     = (eodHr * 60 + eodMn - itmOffset) / 60
     int    itmM     = (eodHr * 60 + eodMn - itmOffset) % 60
