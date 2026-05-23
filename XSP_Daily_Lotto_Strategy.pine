@@ -332,10 +332,10 @@ if goLong
     exitTP1    := t1up
     exitTP2    := t2up
     exitStop   := lockedLow - lockedRange * lvl1Mult * stopMult
-    string cs  = str.tostring(entryStrk, "#.##")
-    string bMsg = useMarket ?
-        '{"ticker":"' + syminfo.ticker + '","action":"buy","sentiment":"bullish","optionType":"call","strike":' + cs + ',"expiry":"0DTE","quantity":' + str.tostring(contracts) + '}' :
-        '{"ticker":"' + syminfo.ticker + '","action":"buy","sentiment":"bullish","optionType":"call","strike":' + cs + ',"expiry":"0DTE","price":"' + str.tostring(bullTrigger, format.mintick) + '","quantity":' + str.tostring(contracts) + '}'
+    string cs     = str.tostring(entryStrk, "#.##")
+    string bBase  = '{"ticker":"' + syminfo.ticker + '","action":"buy","sentiment":"bullish","optionType":"call","strike":' + cs + ',"expiry":"0DTE","quantity":' + str.tostring(contracts) + '}'
+    string bLimit = '{"ticker":"' + syminfo.ticker + '","action":"buy","sentiment":"bullish","optionType":"call","strike":' + cs + ',"expiry":"0DTE","price":"' + str.tostring(bullTrigger, format.mintick) + '","quantity":' + str.tostring(contracts) + '}'
+    string bMsg   = useMarket ? bBase : bLimit
     strategy.entry("Long", strategy.long, qty = contracts, comment = "CALL@" + cs)
     alert(bMsg, alert.freq_once_per_bar)
 
@@ -345,10 +345,10 @@ if goShort
     exitTP1    := t1dn
     exitTP2    := t2dn
     exitStop   := lockedHigh + lockedRange * lvl1Mult * stopMult
-    string ps  = str.tostring(entryStrk, "#.##")
-    string sMsg = useMarket ?
-        '{"ticker":"' + syminfo.ticker + '","action":"sell","sentiment":"bearish","optionType":"put","strike":' + ps + ',"expiry":"0DTE","quantity":' + str.tostring(contracts) + '}' :
-        '{"ticker":"' + syminfo.ticker + '","action":"sell","sentiment":"bearish","optionType":"put","strike":' + ps + ',"expiry":"0DTE","price":"' + str.tostring(bearTrigger, format.mintick) + '","quantity":' + str.tostring(contracts) + '}'
+    string ps     = str.tostring(entryStrk, "#.##")
+    string sBase  = '{"ticker":"' + syminfo.ticker + '","action":"sell","sentiment":"bearish","optionType":"put","strike":' + ps + ',"expiry":"0DTE","quantity":' + str.tostring(contracts) + '}'
+    string sLimit = '{"ticker":"' + syminfo.ticker + '","action":"sell","sentiment":"bearish","optionType":"put","strike":' + ps + ',"expiry":"0DTE","price":"' + str.tostring(bearTrigger, format.mintick) + '","quantity":' + str.tostring(contracts) + '}'
+    string sMsg   = useMarket ? sBase : sLimit
     strategy.entry("Short", strategy.short, qty = contracts, comment = "PUT@" + ps)
     alert(sMsg, alert.freq_once_per_bar)
 
