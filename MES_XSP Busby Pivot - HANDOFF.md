@@ -90,13 +90,14 @@ Multi-line ternary chains (`a ? b :\n c ? d : e`) cause silent compile failures 
 
 | File | Description |
 |---|---|
-| `MES_XSP Busby Style Pivot Predictor.pine` | Main indicator — paste into TradingView Pine Editor |
+| `MES_XSP Busby Style Pivot Predictor.pine` | Busby Pivot indicator — paste into TradingView Pine Editor |
+| `XSP_Daily_Lotto_Strategy.pine` | Daily Lotto 0DTE strategy — paste into TradingView Pine Editor |
 | `MES_XSP Busby Pivot - HANDOFF.md` | This file |
 
 ## Repo
 `https://github.com/majohnst/TradingView.git` — branch `main`
 
-Last commit: `6c3d07b` — "Redesign Busby pivot: fix level anchoring, add MES premarket range, OR box, open label"
+Last commit: `44e1848` — "Revert TP1 to fixed $1.00 price input — remove tp1PremMult"
 
 ---
 
