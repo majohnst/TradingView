@@ -119,9 +119,10 @@ float tp1OptionPrice = input.float(1.00, "TP1 option price target ($)",
               "Bull call: underlying must be $1 above orHigh.  " +
               "Busby PM_HIGH typically sits ~$1 above orHigh — validates this target.",
     group   = GRP_OR)
-float tp2OptionPrice = input.float(2.00, "TP2 option price target ($)",
+float tp2OptionPrice = input.float(1.50, "TP2 option price target ($)",
     minval  = 0.05, step = 0.05,
-    tooltip = "Option value per share at T2.  Underlying $2 past the OR boundary strike.",
+    tooltip = "Option value per share at T2.  Underlying $1.50 past the OR boundary strike.  " +
+              "Tighter than $2.00 — backtesting shows 11 more live fills per 330-day period.",
     group   = GRP_OR)
 int maxPerDir = input.int(1, "Max entries per direction per day",
     minval  = 1, maxval = 3,
@@ -184,6 +185,19 @@ int entryLockMn = input.int(30, "No new entries after minute (NY)",
 // ── TradersPost ───────────────────────────────────────────────────────────────
 bool useMarket = input.bool(true, "Use Market Orders",
     tooltip = "ON: no price field (market order).  OFF: includes trigger price as reference.",
+    group   = GRP_EXEC)
+int tpQtyDir  = input.int(0, "Directional contracts to order (0 = auto)",
+    minval  = 0, maxval = 50,
+    tooltip = "Contracts sent in the TradersPost webhook JSON for CALL/PUT trades.  " +
+              "0 = use auto-sizing from Max Risk ÷ (Premium × 100).  " +
+              "At defaults ($20 risk, $0.10 premium) auto = 2 contracts.  " +
+              "Override here to pin a specific quantity regardless of risk inputs.",
+    group   = GRP_EXEC)
+int tpQtyNeut = input.int(0, "Neutral contracts to order (0 = auto)",
+    minval  = 0, maxval = 50,
+    tooltip = "Contracts sent in the TradersPost webhook JSON for neutral channel trades.  " +
+              "0 = use auto-sizing from Neutral Max Risk ÷ (Neutral Premium × 100).  " +
+              "At defaults ($50 risk, $0.50 premium) auto = 1 contract.",
     group   = GRP_EXEC)
 
 // ── Visuals ───────────────────────────────────────────────────────────────────
@@ -367,6 +381,13 @@ var float exitTP2   = na
 var float exitStop  = na
 var float entryStrk = na
 
+// ── TradersPost Quantity Resolution ──────────────────────────────────────────
+// Auto-sizing uses the same formula as dirContracts / neutContracts.
+// Override inputs (> 0) pin a fixed quantity in the webhook JSON only —
+// the backtest position sizing is unchanged (always uses dirQty / neutQty).
+int webhookDirQty  = tpQtyDir  > 0 ? tpQtyDir  : dirContracts
+int webhookNeutQty = tpQtyNeut > 0 ? tpQtyNeut : neutContracts
+
 // ── Entry Orders ──────────────────────────────────────────────────────────────
 string exitJson = '{"ticker":"' + syminfo.ticker + '","action":"exit"}'
 
@@ -380,8 +401,8 @@ if goLong
     exitTP2   := entryStrk + tp2OptionPrice
     exitStop  := entryStrk
     string cs   = str.tostring(entryStrk, "#.##")
-    string bB   = '{"ticker":"' + syminfo.ticker + '","action":"buy","sentiment":"bullish","optionType":"call","strike":' + cs + ',"expiry":"0DTE","quantity":' + str.tostring(dirContracts) + '}'
-    string bL   = '{"ticker":"' + syminfo.ticker + '","action":"buy","sentiment":"bullish","optionType":"call","strike":' + cs + ',"expiry":"0DTE","price":"' + str.tostring(orLowRef, format.mintick) + '","quantity":' + str.tostring(dirContracts) + '}'
+    string bB   = '{"ticker":"' + syminfo.ticker + '","action":"buy","sentiment":"bullish","optionType":"call","strike":' + cs + ',"expiry":"0DTE","quantity":' + str.tostring(webhookDirQty) + '}'
+    string bL   = '{"ticker":"' + syminfo.ticker + '","action":"buy","sentiment":"bullish","optionType":"call","strike":' + cs + ',"expiry":"0DTE","price":"' + str.tostring(orLowRef, format.mintick) + '","quantity":' + str.tostring(webhookDirQty) + '}'
     strategy.entry("Long", strategy.long, qty = dirQty, limit = entryStrk + maxPremium, comment = "CALL@" + cs)
     alert(useMarket ? bB : bL, alert.freq_once_per_bar)
 
@@ -395,8 +416,8 @@ if goShort
     exitTP2   := entryStrk - tp2OptionPrice
     exitStop  := entryStrk
     string ps   = str.tostring(entryStrk, "#.##")
-    string sB   = '{"ticker":"' + syminfo.ticker + '","action":"sell","sentiment":"bearish","optionType":"put","strike":' + ps + ',"expiry":"0DTE","quantity":' + str.tostring(dirContracts) + '}'
-    string sL   = '{"ticker":"' + syminfo.ticker + '","action":"sell","sentiment":"bearish","optionType":"put","strike":' + ps + ',"expiry":"0DTE","price":"' + str.tostring(orHighRef, format.mintick) + '","quantity":' + str.tostring(dirContracts) + '}'
+    string sB   = '{"ticker":"' + syminfo.ticker + '","action":"sell","sentiment":"bearish","optionType":"put","strike":' + ps + ',"expiry":"0DTE","quantity":' + str.tostring(webhookDirQty) + '}'
+    string sL   = '{"ticker":"' + syminfo.ticker + '","action":"sell","sentiment":"bearish","optionType":"put","strike":' + ps + ',"expiry":"0DTE","price":"' + str.tostring(orHighRef, format.mintick) + '","quantity":' + str.tostring(webhookDirQty) + '}'
     strategy.entry("Short", strategy.short, qty = dirQty, limit = entryStrk - maxPremium, comment = "PUT@" + ps)
     alert(useMarket ? sB : sL, alert.freq_once_per_bar)
 
@@ -408,7 +429,7 @@ if goNeutLong
     exitTP2   := entryStrk + neutTp2Price
     exitStop  := entryStrk
     string ncs  = str.tostring(entryStrk, "#.##")
-    string nB   = '{"ticker":"' + syminfo.ticker + '","action":"buy","sentiment":"neutral","optionType":"call","strike":' + ncs + ',"expiry":"0DTE","quantity":' + str.tostring(neutContracts) + '}'
+    string nB   = '{"ticker":"' + syminfo.ticker + '","action":"buy","sentiment":"neutral","optionType":"call","strike":' + ncs + ',"expiry":"0DTE","quantity":' + str.tostring(webhookNeutQty) + '}'
     strategy.entry("NeutLong", strategy.long, qty = neutQty, limit = entryStrk + neutMaxPrem, comment = "NCALL@" + ncs)
     alert(nB, alert.freq_once_per_bar)
 
@@ -420,7 +441,7 @@ if goNeutShort
     exitTP2   := entryStrk - neutTp2Price
     exitStop  := entryStrk
     string nps  = str.tostring(entryStrk, "#.##")
-    string nS   = '{"ticker":"' + syminfo.ticker + '","action":"sell","sentiment":"neutral","optionType":"put","strike":' + nps + ',"expiry":"0DTE","quantity":' + str.tostring(neutContracts) + '}'
+    string nS   = '{"ticker":"' + syminfo.ticker + '","action":"sell","sentiment":"neutral","optionType":"put","strike":' + nps + ',"expiry":"0DTE","quantity":' + str.tostring(webhookNeutQty) + '}'
     strategy.entry("NeutShort", strategy.short, qty = neutQty, limit = entryStrk - neutMaxPrem, comment = "NPUT@" + nps)
     alert(nS, alert.freq_once_per_bar)
 
