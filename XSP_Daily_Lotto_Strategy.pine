@@ -111,8 +111,27 @@ int maxPerDir = input.int(1, "Max entries per direction per day",
     tooltip = "Hard limit on how many call or put entries can fire each calendar day.  " +
               "Set to 1 for disciplined single-trade days.",
     group   = GRP_OPT)
+int   optMultiplier = input.int(100, "Contract multiplier (shares per contract)",
+    minval  = 1,
+    tooltip = "Standard US equity / index options = 100.  Multiply contracts × multiplier gives total shares for P&L.  " +
+              "Mini options or non-standard contracts may differ.",
+    group   = GRP_OPT)
+float tp1OptionPrice = input.float(1.00, "Target option price at T1 ($)",
+    minval  = 0.05, step = 0.05,
+    tooltip = "Expected option value (per share) when the position hits T1.  " +
+              "Sets the underlying exit level at strike + this value (calls) or strike − this value (puts).  " +
+              "For 0DTE near expiry the option price ≈ its intrinsic value, so a $1 target means the underlying " +
+              "needs to be $1 past the strike.  Adjust based on observed option prices at typical T1 levels.",
+    group   = GRP_OPT)
+float tp2OptionPrice = input.float(2.00, "Target option price at T2 ($)",
+    minval  = 0.05, step = 0.05,
+    tooltip = "Expected option value at T2.  Same logic as T1 — underlying must be this many dollars past the strike.",
+    group   = GRP_OPT)
 
 // ── Exit Settings ─────────────────────────────────────────────────────────────
+// Stop is always at the strike (call strike for longs, put strike for shorts).
+// If price returns to the strike the option is ATM and worth less than the premium paid.
+// Loss = maxPremium × optMultiplier × contracts = exact option debit at risk.
 int   contracts = input.int(2, "Contracts per Trade",
     minval  = 1,
     tooltip = "Use 2+ for T1/T2 ladder exits.  With 1 contract the full position closes at T1.",
@@ -123,12 +142,6 @@ float tp1Pct    = input.float(50.0, "T1 exit size (%)",
     tooltip = "Percentage of the position to close at T1.  Remainder runs to T2 or stop.",
     group   = GRP_EXIT)
 bool  tp2En     = input.bool(true, "Final exit at T2", group = GRP_EXIT)
-bool  stopEn    = input.bool(true, "Enable stop loss", group = GRP_EXIT)
-float stopMult  = input.float(1.0, "Stop (× T1 extension past PM level)",
-    minval  = 0.25, step = 0.25,
-    tooltip = "Stop placed N × the T1 extension distance on the adverse side of the entry PM level.  " +
-              "1.0 = stop at T1↓ for bull call (same distance below PM_LOW as T1 is above PM_HIGH).",
-    group   = GRP_EXIT)
 bool  itmCheckEn  = input.bool(true, "Close if ITM before expiry",
     tooltip = "At the configured minutes-before-EOD window, checks if the open position is ITM.  " +
               "If it is — and not deep-ITM on a cash-settled instrument — closes for whatever intrinsic value remains.  " +
@@ -353,59 +366,76 @@ var float entryStrk = na
 // ── Entry Orders ──────────────────────────────────────────────────────────────
 string exitJson = '{"ticker":"' + syminfo.ticker + '","action":"exit"}'
 
+// effQty: contracts × optMultiplier so Pine P&L reflects the 100-shares-per-contract reality.
+// Entry uses a limit at strike + maxPremium (long) / strike − maxPremium (short).
+//   Fill happens when price bounces back above/below that level after the spike.
+//   Stop at the strike exactly → loss distance = maxPremium → loss $ = maxPremium × effQty.
+// TP levels use option intrinsic targets, not underlying gamma proxy extensions.
+//   TP underlying level = strike ± tp1/tp2OptionPrice  (≈ intrinsic value for 0DTE near expiry).
+//   Gain $ at TP1 = (tp1OptionPrice − maxPremium) × effQty × (tp1Pct/100).
+int effQty = contracts * optMultiplier
+
 if goLong
     bullCount  := bullCount + 1
     entryStrk  := snap(lockedLow)
-    exitTP1    := t1up
-    exitTP2    := t2up
-    exitStop   := lockedLow - lockedRange * lvl1Mult * stopMult
+    exitTP1    := entryStrk + tp1OptionPrice
+    exitTP2    := entryStrk + tp2OptionPrice
+    exitStop   := entryStrk           // stop AT call strike — option ATM, worth < premium
     string cs     = str.tostring(entryStrk, "#.##")
     string bBase  = '{"ticker":"' + syminfo.ticker + '","action":"buy","sentiment":"bullish","optionType":"call","strike":' + cs + ',"expiry":"0DTE","quantity":' + str.tostring(contracts) + '}'
     string bLimit = '{"ticker":"' + syminfo.ticker + '","action":"buy","sentiment":"bullish","optionType":"call","strike":' + cs + ',"expiry":"0DTE","price":"' + str.tostring(bullTrigger, format.mintick) + '","quantity":' + str.tostring(contracts) + '}'
     string bMsg   = useMarket ? bBase : bLimit
-    strategy.entry("Long", strategy.long, qty = contracts, comment = "CALL@" + cs)
+    strategy.entry("Long", strategy.long, qty = effQty, limit = entryStrk + maxPremium, comment = "CALL@" + cs)
     alert(bMsg, alert.freq_once_per_bar)
 
 if goShort
     bearCount  := bearCount + 1
     entryStrk  := snap(lockedHigh)
-    exitTP1    := t1dn
-    exitTP2    := t2dn
-    exitStop   := lockedHigh + lockedRange * lvl1Mult * stopMult
+    exitTP1    := entryStrk - tp1OptionPrice
+    exitTP2    := entryStrk - tp2OptionPrice
+    exitStop   := entryStrk           // stop AT put strike — option ATM, worth < premium
     string ps     = str.tostring(entryStrk, "#.##")
     string sBase  = '{"ticker":"' + syminfo.ticker + '","action":"sell","sentiment":"bearish","optionType":"put","strike":' + ps + ',"expiry":"0DTE","quantity":' + str.tostring(contracts) + '}'
     string sLimit = '{"ticker":"' + syminfo.ticker + '","action":"sell","sentiment":"bearish","optionType":"put","strike":' + ps + ',"expiry":"0DTE","price":"' + str.tostring(bearTrigger, format.mintick) + '","quantity":' + str.tostring(contracts) + '}'
     string sMsg   = useMarket ? sBase : sLimit
-    strategy.entry("Short", strategy.short, qty = contracts, comment = "PUT@" + ps)
+    strategy.entry("Short", strategy.short, qty = effQty, limit = entryStrk - maxPremium, comment = "PUT@" + ps)
     alert(sMsg, alert.freq_once_per_bar)
 
+// ── Cancel Pending Limit Entries After Entry Lock ────────────────────────────
+// If the spike limit order hasn't filled by the entry cutoff, kill it.
+// strategy.close_all() does NOT cancel pending entries — cancel_all() is needed.
+if afterLock and not afterLock[1]
+    strategy.cancel_all()
+
 // ── Exit Orders ───────────────────────────────────────────────────────────────
-// Stop on TP2 (remainder) only — TP1 is a straight limit, no stop.
-// If stop fires before T1: TP2 order closes remainder; TP1 is auto-cancelled.
+// Stop always active at the strike level (no stopEn toggle — for options, the
+// strike IS the only meaningful stop: option is ATM and worth less than paid).
+// Stop on TP2 only — TP1 is a straight limit.
+// If stop fires before T1: TP2 closes remainder; TP1 auto-cancels.
 // If T1 fires first: TP2 covers the remaining half at T2 or stop.
 if strategy.position_size > 0
-    float sl = stopEn and not na(exitStop) ? exitStop : na
+    float sl = not na(exitStop) ? exitStop : na
     if tp1En and tp2En
-        strategy.exit("Long TP1", from_entry="Long", qty_percent=tp1Pct, limit=exitTP1,           comment_profit="T1")
-        strategy.exit("Long TP2", from_entry="Long",                     limit=exitTP2, stop=sl,   comment_profit="T2", comment_loss="Stop")
+        strategy.exit("Long TP1", from_entry="Long", qty_percent=tp1Pct, limit=exitTP1,          comment_profit="T1")
+        strategy.exit("Long TP2", from_entry="Long",                     limit=exitTP2, stop=sl,  comment_profit="T2", comment_loss="Stop@Strike")
     else if tp1En
-        strategy.exit("Long TP1", from_entry="Long", limit=exitTP1, stop=sl, comment_profit="T1", comment_loss="Stop")
+        strategy.exit("Long TP1", from_entry="Long", limit=exitTP1, stop=sl, comment_profit="T1", comment_loss="Stop@Strike")
     else if tp2En
-        strategy.exit("Long TP2", from_entry="Long", limit=exitTP2, stop=sl, comment_profit="T2", comment_loss="Stop")
-    else if stopEn and not na(sl)
-        strategy.exit("Long Stop", from_entry="Long", stop=sl, comment_loss="Stop")
+        strategy.exit("Long TP2", from_entry="Long", limit=exitTP2, stop=sl, comment_profit="T2", comment_loss="Stop@Strike")
+    else
+        strategy.exit("Long Stop", from_entry="Long", stop=sl, comment_loss="Stop@Strike")
 
 if strategy.position_size < 0
-    float sl = stopEn and not na(exitStop) ? exitStop : na
+    float sl = not na(exitStop) ? exitStop : na
     if tp1En and tp2En
-        strategy.exit("Short TP1", from_entry="Short", qty_percent=tp1Pct, limit=exitTP1,          comment_profit="T1")
-        strategy.exit("Short TP2", from_entry="Short",                     limit=exitTP2, stop=sl,  comment_profit="T2", comment_loss="Stop")
+        strategy.exit("Short TP1", from_entry="Short", qty_percent=tp1Pct, limit=exitTP1,         comment_profit="T1")
+        strategy.exit("Short TP2", from_entry="Short",                     limit=exitTP2, stop=sl, comment_profit="T2", comment_loss="Stop@Strike")
     else if tp1En
-        strategy.exit("Short TP1", from_entry="Short", limit=exitTP1, stop=sl, comment_profit="T1", comment_loss="Stop")
+        strategy.exit("Short TP1", from_entry="Short", limit=exitTP1, stop=sl, comment_profit="T1", comment_loss="Stop@Strike")
     else if tp2En
-        strategy.exit("Short TP2", from_entry="Short", limit=exitTP2, stop=sl, comment_profit="T2", comment_loss="Stop")
-    else if stopEn and not na(sl)
-        strategy.exit("Short Stop", from_entry="Short", stop=sl, comment_loss="Stop")
+        strategy.exit("Short TP2", from_entry="Short", limit=exitTP2, stop=sl, comment_profit="T2", comment_loss="Stop@Strike")
+    else
+        strategy.exit("Short Stop", from_entry="Short", stop=sl, comment_loss="Stop@Strike")
 
 // ── ITM-30 Check ─────────────────────────────────────────────────────────────
 // Runs once per day when the check window opens (default 30 min before EOD).
@@ -433,6 +463,7 @@ if itmCheckEn and isItmCheckTime and not itmCheckFired and strategy.position_siz
 // ── EOD Force-Close ───────────────────────────────────────────────────────────
 // When eodEn is OFF the position is left to expire — no close fee, no day trade.
 if eodEn and isEod and strategy.position_size != 0
+    strategy.cancel_all()
     strategy.close_all(comment = "EOD")
     alert(exitJson, alert.freq_once_per_bar)
 
@@ -472,8 +503,14 @@ if mktOpen and showLabels
     string btS   = str.tostring(bullTrigger,      "#.##")
     string beS   = str.tostring(bearTrigger,      "#.##")
     string ln1   = sentText + " | Pivot: " + str.tostring(lockedPivot, "#.##") + "  |  Spike req: " + spkS + " pt  (max $" + str.tostring(maxPremium, "#.##") + ")"
-    string ln2   = "CALL strike " + cs + " → fill when price ≤ " + btS + "  |  T1: " + str.tostring(t1up, "#.##") + "  T2: " + str.tostring(t2up, "#.##")
-    string ln3   = "PUT  strike " + ps + " → fill when price ≥ " + beS + "  |  T1: " + str.tostring(t1dn, "#.##") + "  T2: " + str.tostring(t2dn, "#.##")
+    string cFill = str.tostring(snap(lockedLow)  + maxPremium, "#.##")
+    string pFill = str.tostring(snap(lockedHigh) - maxPremium, "#.##")
+    string cT1   = str.tostring(snap(lockedLow)  + tp1OptionPrice, "#.##")
+    string cT2   = str.tostring(snap(lockedLow)  + tp2OptionPrice, "#.##")
+    string pT1   = str.tostring(snap(lockedHigh) - tp1OptionPrice, "#.##")
+    string pT2   = str.tostring(snap(lockedHigh) - tp2OptionPrice, "#.##")
+    string ln2   = "CALL " + cs + " spike≤" + btS + " fill@" + cFill + "  T1@" + cT1 + "($" + str.tostring(tp1OptionPrice, "#.##") + ")  T2@" + cT2 + "($" + str.tostring(tp2OptionPrice, "#.##") + ")"
+    string ln3   = "PUT  " + ps + " spike≥" + beS + " fill@" + pFill + "  T1@" + pT1 + "($" + str.tostring(tp1OptionPrice, "#.##") + ")  T2@" + pT2 + "($" + str.tostring(tp2OptionPrice, "#.##") + ")"
     color  lc    = isBull ? color.green : isBear ? color.red : color.orange
     openLabel := label.new(bar_index, lockedHigh, ln1 + "\n" + ln2 + "\n" + ln3, color=lc, textcolor=color.white, style=label.style_label_down, size=size.small)
 
@@ -489,6 +526,13 @@ plot(t2dn,        "T2 ↓",        color=color.red,                  linewidth=2
 // Trigger zone lines — where price needs to trade for entry to fire.
 plot(isMkt ? bullTrigger : na, "Bull Trigger (call fill zone)", color=color.new(color.lime,   55), linewidth=1, style=plot.style_linebr)
 plot(isMkt ? bearTrigger : na, "Bear Trigger (put fill zone)",  color=color.new(color.orange, 55), linewidth=1, style=plot.style_linebr)
+
+// Option-price TP levels — where the underlying must be for the option to hit T1/T2 value.
+// These are the ACTUAL exit triggers.  The gamma proxy lines above are structural reference only.
+plot(isMkt ? lockedLow  + tp1OptionPrice : na, "Call TP1 ($" + str.tostring(tp1OptionPrice, "#.##") + ")", color=color.new(color.green,  40), linewidth=1, style=plot.style_linebr)
+plot(isMkt ? lockedLow  + tp2OptionPrice : na, "Call TP2 ($" + str.tostring(tp2OptionPrice, "#.##") + ")", color=color.new(color.green,  10), linewidth=2, style=plot.style_linebr)
+plot(isMkt ? lockedHigh - tp1OptionPrice : na, "Put  TP1 ($" + str.tostring(tp1OptionPrice, "#.##") + ")", color=color.new(color.red,    40), linewidth=1, style=plot.style_linebr)
+plot(isMkt ? lockedHigh - tp2OptionPrice : na, "Put  TP2 ($" + str.tostring(tp2OptionPrice, "#.##") + ")", color=color.new(color.red,    10), linewidth=2, style=plot.style_linebr)
 
 bgcolor(close > lockedPivot ? color.new(color.green, 93) : close < lockedPivot ? color.new(color.red, 93) : na)
 
@@ -507,9 +551,15 @@ if barstate.islast and showStatus
     string ln1  = "XSP Daily Lotto  |  Bias: " + sentText + "  (" + sentSymbol + ")"
     string ln2  = "CALL strike " + cs + "  |  entry ≤ " + btS + "  |  " + bFired
     string ln3  = "PUT  strike " + ps + "  |  entry ≥ " + beS + "  |  " + eFired
-    string ln4  = "Spike req: " + spkS + " pt  |  max cost: $" + str.tostring(maxPremium, "#.##") + "  @  $" + str.tostring(costPerPt, "#.##") + "/pt"
-    string ln5  = "T1/T2 bull: " + str.tostring(t1up, "#.##") + " / " + str.tostring(t2up, "#.##") + "   bear: " + str.tostring(t1dn, "#.##") + " / " + str.tostring(t2dn, "#.##")
-    string ln6  = "OR: " + orS + "   Stop mult: " + str.tostring(stopMult, "#.##") + "×"
+    int   tp1Qty   = math.max(1, math.round(contracts * tp1Pct / 100.0))
+    int   tp2Qty   = contracts - tp1Qty
+    float maxLoss  = maxPremium      * optMultiplier * contracts
+    float tp1Gain  = (tp1OptionPrice - maxPremium) * optMultiplier * tp1Qty
+    float tp2Gain  = (tp2OptionPrice - maxPremium) * optMultiplier * tp2Qty
+    float fullWin  = tp1Gain + tp2Gain
+    string ln4  = "P&L model (" + str.tostring(contracts) + "c × " + str.tostring(optMultiplier) + "): loss=$-" + str.tostring(maxLoss, "#") + "  TP1=$+" + str.tostring(tp1Gain, "#") + "  TP2=$+" + str.tostring(tp2Gain, "#") + "  full win=$+" + str.tostring(fullWin, "#")
+    string ln5  = "Spike req: " + spkS + " pt  |  max cost $" + str.tostring(maxPremium, "#.##") + "  |  option T1/T2: $" + str.tostring(tp1OptionPrice, "#.##") + " / $" + str.tostring(tp2OptionPrice, "#.##")
+    string ln6  = "OR: " + orS
     string eodStr  = eodEn ? "force-close @ " + str.tostring(eodHr) + ":" + (eodMn < 10 ? "0" : "") + str.tostring(eodMn) + " NY" : "OFF (let expire)"
     int    itmH    = (eodHr * 60 + eodMn - itmOffset) / 60
     int    itmM    = (eodHr * 60 + eodMn - itmOffset) % 60
