@@ -1,0 +1,350 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International  
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © BackQuant
+
+//@version=6
+indicator(
+ "Gamma Exposure Levels [BackQuant]", 
+ overlay=true
+ )
+
+// Constants {
+const string g_allexp = "All-Expiry Levels"
+const string g_0dte   = "0DTE Levels"
+const string g_advlvl = "Advanced Levels"
+const string g_gex    = "GEX Top 10"
+// }
+
+// Main Text {
+txt = input.text_area(defval="", title="Paste GEX Levels Data", group="Data Input", tooltip="Paste the full GEX output text here. The indicator will parse all $ values and plot them as horizontal levels.")
+// }
+
+// All Expiries {
+color_hvl      = input.color(color.yellow, "HVL", group=g_allexp, inline="HVL")
+show_hvl       = input.bool(true, " ", group=g_allexp, inline="HVL", tooltip="All-expiry High Volume Level — the price with the highest total gamma exposure across all expirations.")
+color_call_res = input.color(color.green, "Call Resistance",  group=g_allexp, inline="all-call-res")
+show_call_res  = input.bool(true, " ", group=g_allexp, inline="all-call-res", tooltip="Resistance from call gamma — price level where call-side gamma creates overhead resistance.")
+color_put_sup  = input.color(color.red, "Put Support", group=g_allexp, inline="all-put-sup")
+show_put_sup   = input.bool(true, " ", group=g_allexp, inline="all-put-sup", tooltip="Support from put gamma — price level where put-side gamma creates downside support.")
+// }
+
+// 0DTE {
+color_0dte_hvl  = input.color(color.orange, "0DTE HVL", group=g_0dte, inline="0dte-hvl")
+show_0dte_hvl   = input.bool(true, " ", group=g_0dte, inline="0dte-hvl", tooltip="Same-day options gamma flip — the 0DTE high volume level where intraday gamma flips polarity.")
+color_0dte_call = input.color(color.lime, "0DTE Call", group=g_0dte, inline="0dte-call")
+show_0dte_call  = input.bool(true, " ", group=g_0dte, inline="0dte-call", tooltip="Same-day call resistance — resistance level derived from 0DTE call gamma only.")
+color_0dte_put  = input.color(color.fuchsia, "0DTE Put",  group=g_0dte, inline="0dte-put")
+show_0dte_put   = input.bool(true, " ", group=g_0dte, inline="0dte-put", tooltip="Same-day put support — support level derived from 0DTE put gamma only.")
+// }
+
+// Advanced Toggles {
+color_zero_gamma = input.color(color.aqua, "Zero Gamma", group=g_advlvl, inline="adv-zero")
+show_zero_gamma  = input.bool(true, " ", group=g_advlvl, inline="adv-zero", tooltip="Precise price where cumulative gamma equals zero. Above this level dealers hedge in a stabilizing way; below it they amplify moves.")
+color_max_pain   = input.color(color.white,  "Max Pain", group=g_advlvl, inline="adv-mpain")
+show_max_pain    = input.bool(true, " ", group=g_advlvl, inline="adv-mpain", tooltip="Strike where option holders lose the most — the price at which the total value of all outstanding options is minimized.")
+color_exp_move   = input.color(color.gray,   "Expected Move", group=g_advlvl, inline="adv-expm")
+show_exp_move    = input.bool(true, " ", group=g_advlvl, inline="adv-expm", tooltip="1-sigma expected move (±1 SD) — the upper and lower bounds of the statistically expected price range.")
+color_flip_zones = input.color(color.purple, "Flip Zones", group=g_advlvl, inline="adv-flipz")
+show_flip_zones  = input.bool(true, " ", group=g_advlvl, inline="adv-flipz", tooltip="All levels where gamma polarity changes — prices where dealer hedging behavior flips from supportive to destabilizing or vice versa.")
+// } 
+
+// GEX Top 10 Inputs {
+select_lvl = input.string("0DTE", "Show GEX Levels 1-10", options=["None", "0DTE", "All Expiries", "0DTE 1-5", "All Expiries 1-5"], group=g_gex, tooltip="Select which GEX Top 10 dataset to plot. 0DTE = same-day gamma strikes. All Expiries = full expiration gamma strikes.")
+
+color_top1  = input.color(color.blue,"GEX #1",  group=g_gex, inline="GEX1")
+show_gex1   = input.bool(true, " ", group=g_gex, inline="GEX1", tooltip="GEX Top 10 Strikes ranked by |gamma|. #1 has the highest absolute gamma exposure.")
+color_top2  = input.color(color.blue,"GEX #2",  group=g_gex, inline="GEX2")
+show_gex2   = input.bool(true, " ", group=g_gex, inline="GEX2", tooltip="GEX Top 10 — Strike #2 by absolute gamma exposure.")
+color_top3  = input.color(color.blue,"GEX #3",  group=g_gex, inline="GEX3")
+show_gex3   = input.bool(true, " ", group=g_gex, inline="GEX3", tooltip="GEX Top 10 — Strike #3 by absolute gamma exposure.")
+color_top4  = input.color(color.blue,"GEX #4",  group=g_gex, inline="GEX4")
+show_gex4   = input.bool(true, " ", group=g_gex, inline="GEX4", tooltip="GEX Top 10 — Strike #4 by absolute gamma exposure.")
+color_top5  = input.color(color.blue,"GEX #5",  group=g_gex, inline="GEX5")
+show_gex5   = input.bool(true, " ", group=g_gex, inline="GEX5", tooltip="GEX Top 10 — Strike #5 by absolute gamma exposure.")
+color_top6  = input.color(color.blue,"GEX #6",  group=g_gex, inline="GEX6")
+show_gex6   = input.bool(true, " ", group=g_gex, inline="GEX6", tooltip="GEX Top 10 — Strike #6 by absolute gamma exposure.")
+color_top7  = input.color(color.blue,"GEX #7",  group=g_gex, inline="GEX7")
+show_gex7   = input.bool(true, " ", group=g_gex, inline="GEX7", tooltip="GEX Top 10 — Strike #7 by absolute gamma exposure.")
+color_top8  = input.color(color.blue,"GEX #8",  group=g_gex, inline="GEX8")
+show_gex8   = input.bool(true, " ", group=g_gex, inline="GEX8", tooltip="GEX Top 10 — Strike #8 by absolute gamma exposure.")
+color_top9  = input.color(color.blue,"GEX #9",  group=g_gex, inline="GEX9")
+show_gex9   = input.bool(true, " ", group=g_gex, inline="GEX9", tooltip="GEX Top 10 — Strike #9 by absolute gamma exposure.")
+color_top10 = input.color(color.blue,"GEX #10", group=g_gex, inline="GEX10")
+show_gex10  = input.bool(true, " ", group=g_gex, inline="GEX10", tooltip="GEX Top 10 — Strike #10 by absolute gamma exposure.")
+// }
+
+// Style & Labels {
+line_width = input.int(1, "Line Width", minval=1, maxval=4, group="Style")
+line_style_input = input.string("Dashed", "Line Style", options=["Solid", "Dashed", "Dotted"], group="Style")
+extend_lines = input.string("Both", "Extend Lines", options=["Both", "Right", "Left", "None"], group="Style")
+
+label_size_input = input.string("small", "Label Size", options=["tiny", "small", "normal", "large", "huge"], group="Label Settings", tooltip="Size of the label text next to each level.")
+label_offset = input.int(45, "Label Offset (bars)", minval=-200, maxval=500, group="Label Settings", tooltip="How many bars to the right (positive) or left (negative) of the current bar the label is placed.")
+label_position = input.string("Right", "Label Side", options=["Right", "Left"], group="Label Settings", tooltip="Which side of the chart to place labels on.")
+// }
+
+// Helper Functions {
+// Styling Helpers
+get_line_style() =>
+    line_style_input == "Solid" ? line.style_solid : line_style_input == "Dotted" ? line.style_dotted : line.style_dashed
+
+get_label_size() =>
+    label_size_input == "tiny" ? size.tiny : label_size_input == "large" ? size.large : label_size_input == "huge" ? size.huge : label_size_input == "normal" ? size.normal : size.small
+
+get_extend() =>
+    extend_lines == "Both" ? extend.both : extend_lines == "Right" ? extend.right : extend_lines == "Left" ? extend.left : extend.none
+
+get_label_bar() =>
+    label_position == "Left" ? bar_index - math.abs(label_offset) : bar_index + label_offset
+
+get_label_style() =>
+    label_position == "Left" ? label.style_label_right : label.style_none
+
+is_digit(string ch) =>
+    ch == "0" or ch == "1" or ch == "2" or ch == "3" or ch == "4" or ch == "5" or ch == "6" or ch == "7" or ch == "8" or ch == "9"
+
+// PARSE: extract number after first "$" following a key
+parse_dollar(string src, string key) =>
+    float result = na
+    int idx = str.pos(src, key)
+    if not na(idx)
+        string sub = str.substring(src, idx + str.length(key))
+        int dIdx = str.pos(sub, "$")
+        if not na(dIdx)
+            string after = str.substring(sub, dIdx + 1)
+            string numStr = ""
+            bool done = false
+            for i = 0 to str.length(after) - 1
+                if not done
+                    string ch = str.substring(after, i, i + 1)
+                    if is_digit(ch) or ch == "."
+                        numStr := numStr + ch
+                    else if ch == ","
+                        numStr := numStr
+                    else
+                        done := true
+            if str.length(numStr) > 0
+                result := str.tonumber(numStr)
+    result
+
+// PARSE: Expected Move low
+parse_exp_low(string src) =>
+    parse_dollar(src, "Expected Move:")
+
+// PARSE: Expected Move high (after " to ")
+parse_exp_high(string src) =>
+    float result = na
+    int idx = str.pos(src, "Expected Move:")
+    if not na(idx)
+        string sub = str.substring(src, idx)
+        int toIdx = str.pos(sub, " to ")
+        if not na(toIdx)
+            string afterTo = str.substring(sub, toIdx + 4)
+            int dIdx = str.pos(afterTo, "$")
+            if not na(dIdx)
+                string after = str.substring(afterTo, dIdx + 1)
+                string numStr = ""
+                bool done = false
+                for i = 0 to str.length(after) - 1
+                    if not done
+                        string ch = str.substring(after, i, i + 1)
+                        if is_digit(ch) or ch == "."
+                            numStr := numStr + ch
+                        else if ch == ","
+                            numStr := numStr
+                        else
+                            done := true
+                if str.length(numStr) > 0
+                    result := str.tonumber(numStr)
+    result
+
+// PARSE: Flip Zones (scan for each $, handle thousands commas)
+parse_flip_zones(string src) =>
+    array<float> zones = array.new_float()
+    // Try both "Flip Zones (All):" and "Flip Zones:"
+    int idx = str.pos(src, "Flip Zones (All):")
+    int offset = 17
+    if na(idx)
+        idx := str.pos(src, "Flip Zones:")
+        offset := 11
+    if not na(idx)
+        string sub = str.substring(src, idx + offset)
+        int nlIdx = str.pos(sub, "\n")
+        string line_str = na(nlIdx) ? sub : str.substring(sub, 0, nlIdx)
+        for i = 0 to str.length(line_str) - 1
+            if str.substring(line_str, i, i + 1) == "$"
+                string after = str.substring(line_str, i + 1)
+                string numStr = ""
+                bool done = false
+                for j = 0 to str.length(after) - 1
+                    if not done
+                        string ch = str.substring(after, j, j + 1)
+                        if is_digit(ch) or ch == "."
+                            numStr := numStr + ch
+                        else if ch == ","
+                            if j + 1 < str.length(after) and is_digit(str.substring(after, j + 1, j + 2))
+                                numStr := numStr
+                            else
+                                done := true
+                        else
+                            done := true
+                if str.length(numStr) > 0
+                    array.push(zones, str.tonumber(numStr))
+    zones
+
+// PARSE: GEX Top 10 (generic — pass section header)
+parse_gex_top(string src, string header) =>
+    array<float> levels = array.new_float()
+    int idx = str.pos(src, header)
+    if not na(idx)
+        string sub = str.substring(src, idx)
+        string[] lines = str.split(sub, "\n")
+        for i = 1 to math.min(array.size(lines) - 1, 12)
+            string ln = str.trim(array.get(lines, i))
+            if str.length(ln) > 0
+                // Stop if we hit a new section header or separator
+                if str.contains(ln, "━") or (str.contains(ln, "GEX Top 10") and i > 0)
+                    break
+                int dIdx = str.pos(ln, "$")
+                if not na(dIdx)
+                    string after = str.substring(ln, dIdx + 1)
+                    string numStr = ""
+                    bool done = false
+                    for j = 0 to str.length(after) - 1
+                        if not done
+                            string ch = str.substring(after, j, j + 1)
+                            if is_digit(ch) or ch == "."
+                                numStr := numStr + ch
+                            else if ch == ","
+                                numStr := numStr
+                            else
+                                done := true
+                    if str.length(numStr) > 0
+                        array.push(levels, str.tonumber(numStr))
+    levels
+
+// GEX toggle + color helpers
+is_gex_on(int idx) =>
+    idx == 0 ? show_gex1 : idx == 1 ? show_gex2 : idx == 2 ? show_gex3 : idx == 3 ? show_gex4 : idx == 4 ? show_gex5 : idx == 5 ? show_gex6 : idx == 6 ? show_gex7 : idx == 7 ? show_gex8 : idx == 8 ? show_gex9 : idx == 9 ? show_gex10 : false
+
+get_gex_color(int idx) =>
+    idx == 0 ? color_top1 : idx == 1 ? color_top2 : idx == 2 ? color_top3 : idx == 3 ? color_top4 : idx == 4 ? color_top5 : idx == 5 ? color_top6 : idx == 6 ? color_top7 : idx == 7 ? color_top8 : idx == 8 ? color_top9 : idx == 9 ? color_top10 : color.blue
+
+// Overlap Handling 
+add_level(array<float> p, array<string> l, array<color> c, float price, string lbl, color col) =>
+    bool matched = false
+    if not na(price) and price > 0
+        if array.size(p) > 0
+            for i = 0 to array.size(p) - 1
+                if not matched and math.abs(array.get(p, i) - price) < 0.5
+                    array.set(l, i, array.get(l, i) + " / " + lbl)
+                    matched := true
+        if not matched
+            array.push(p, price)
+            array.push(l, lbl)
+            array.push(c, col)
+    matched
+// End Helpers }
+
+// init arrays
+var array<line>  drawn_lines  = array.new_line()
+var array<label> drawn_labels = array.new_label()
+
+// main.pine 
+if barstate.islast and str.length(txt) > 0
+
+    if drawn_lines.size() > 0
+        for i = 0 to drawn_lines.size() - 1
+            line.delete(drawn_lines.get(i))
+    drawn_lines.clear()
+
+    if drawn_labels.size() > 0
+        for i = 0 to drawn_labels.size() - 1
+            label.delete(drawn_labels.get(i))
+    drawn_labels.clear()
+
+    var array<float>  all_prices = array.new_float()
+    var array<string> all_labels = array.new_string()
+    var array<color>  all_colors = array.new_color()
+    all_prices.clear()
+    all_labels.clear()
+    all_colors.clear()
+
+    // Parse core levels
+    float hvl_val = parse_dollar(txt, "HVL:")
+    float call_res_val = parse_dollar(txt, "Call Resistance:")
+    float put_sup_val = parse_dollar(txt, "Put Support:")
+    float dte_hvl_val = parse_dollar(txt, "0DTE HVL:")
+    float dte_call_val = parse_dollar(txt, "0DTE Call:")
+    float dte_put_val = parse_dollar(txt, "0DTE Put:")
+    float zgamma_val = parse_dollar(txt, "Zero Gamma:")
+    float maxpain_val = parse_dollar(txt, "Max Pain:")
+    float exp_lo = parse_exp_low(txt)
+    float exp_hi = parse_exp_high(txt)
+
+    // All-expiry
+    if show_hvl
+        add_level(all_prices, all_labels, all_colors, hvl_val, "HVL", color_hvl)
+    if show_call_res
+        add_level(all_prices, all_labels, all_colors, call_res_val, "Call Res", color_call_res)
+    if show_put_sup
+        add_level(all_prices, all_labels, all_colors, put_sup_val, "Put Sup", color_put_sup)
+
+    // 0DTE
+    if show_0dte_hvl
+        add_level(all_prices, all_labels, all_colors, dte_hvl_val, "0DTE HVL", color_0dte_hvl)
+    if show_0dte_call
+        add_level(all_prices, all_labels, all_colors, dte_call_val, "0DTE Call", color_0dte_call)
+    if show_0dte_put
+        add_level(all_prices, all_labels, all_colors, dte_put_val, "0DTE Put", color_0dte_put)
+
+    // Advanced
+    if show_zero_gamma
+        add_level(all_prices, all_labels, all_colors, zgamma_val, "Zero Γ", color_zero_gamma)
+    if show_max_pain
+        add_level(all_prices, all_labels, all_colors, maxpain_val, "Max Pain", color_max_pain)
+    if show_exp_move
+        add_level(all_prices, all_labels, all_colors, exp_lo, "Expected Move Lower", color_exp_move)
+        add_level(all_prices, all_labels, all_colors, exp_hi, "Expected Move Upper", color_exp_move)
+
+    // Flip zones
+    if show_flip_zones
+        array<float> fz = parse_flip_zones(txt)
+        if fz.size() > 0
+            for i = 0 to fz.size() - 1
+                add_level(all_prices, all_labels, all_colors, fz.get(i), "Flip", color_flip_zones)
+
+    // GEX Top 10 (based on dropdown selection)
+    if select_lvl != "None"
+        // Determine which section to parse
+        string gex_header = ""
+        string gex_prefix = ""
+        int gex_max = 9
+
+        if select_lvl == "0DTE" or select_lvl == "0DTE 1-5"
+            gex_header := "0DTE GEX Top 10"
+            gex_prefix := "0D#"
+        else
+            gex_header := "All-Expiry GEX Top 10"
+            gex_prefix := "AE#"
+
+        if select_lvl == "0DTE 1-5" or select_lvl == "All Expiries 1-5"
+            gex_max := 4
+
+        array<float> t10 = parse_gex_top(txt, gex_header)
+        if t10.size() > 0
+            for i = 0 to math.min(t10.size() - 1, gex_max)
+                if is_gex_on(i)
+                    add_level(all_prices, all_labels, all_colors, t10.get(i), gex_prefix + str.tostring(i + 1), get_gex_color(i))
+
+    // plot
+    int lbl_bar = get_label_bar()
+    if all_prices.size() > 0
+        for i = 0 to all_prices.size() - 1
+            float   prc = all_prices.get(i)
+            string  lbl = all_labels.get(i)
+            color   col = all_colors.get(i)
+            line  ln = line.new(bar_index - 1, prc, bar_index, prc, extend=get_extend(), color=col, style=get_line_style(), width=line_width)
+            label lb = label.new(lbl_bar, prc, lbl + "  " + str.tostring(prc, format.mintick), style=get_label_style(), textcolor=col, color=#363a4500, size=get_label_size())
+            drawn_lines.push(ln)
+            drawn_labels.push(lb)
