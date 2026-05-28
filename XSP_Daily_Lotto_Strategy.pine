@@ -1,0 +1,650 @@
+// ============================================================================
+//  XSP Daily Lotto — Strategy  (v2 — OR-based entry model)
+//  0DTE Opening Range fade strategy with TradersPost webhook support
+//  Pine Script v6
+//
+//  TRADE LOGIC:
+//    Opening Range (first N minutes of RTH) sets the daily reference box.
+//    After OR closes, one trade per session based on sentiment:
+//
+//    BULL day:  BTO CALL at snap(orHigh) — the OR top strike.
+//               Entry fires when price PULLS BACK to orLow (OR bottom).
+//               Expected: OR breakout resumes upward after the pullback fills.
+//               TP1 = orHigh + tp1OptionPrice   (e.g. $1.00 — underlying $1 past OR strike)
+//               TP2 = orHigh + tp2OptionPrice   (e.g. $1.50 — profit runner)
+//               Stop = orHigh (call ATM = 0 intrinsic for 0DTE)
+//
+//    BEAR day:  BTO PUT at snap(orLow) — the OR bottom strike.
+//               Entry fires when price SPIKES UP to orHigh (OR top).
+//               Expected: false pop fades back through the OR range.
+//               TP1 = orLow − tp1OptionPrice
+//               TP2 = orLow − tp2OptionPrice
+//               Stop = orLow (put ATM)
+//
+//    NEUTRAL day (separate toggle):  Channel fade, Busby Pivot as strike.
+//               First OR boundary touch sets direction:
+//                 Top touch  → BTO PUT  at snap(lockedPivot)  (fade the spike)
+//                 Bot touch  → BTO CALL at snap(lockedPivot)  (buy the dip)
+//               Higher premium ($0.50 default) — pivot strike is closer to ATM.
+//               Separate TP1/TP2 option price targets.
+//
+//  OPTION P&L MODEL:
+//    Pine tracks underlying price P&L — modelled as:
+//      qty   = contracts × 100                 (optMultiplier)
+//      entry = limit at strike ± maxPremium    (fills when price is at OR boundary)
+//      stop  = at the strike (option ATM → 0 intrinsic for 0DTE)
+//      TP    = strike ± tp1/tp2OptionPrice
+//    Max loss  = maxPremium × 100 × contracts
+//    Full win  = (tp1Gain + tp2Gain) × 100 per ladder leg
+//    Contracts = floor(maxRiskDollars ÷ (maxPremium × 100))
+//
+//  TRADERSPOST:
+//    One alert() fires per entry (JSON: strike, optionType, expiry:0DTE).
+//    One alert() fires per exit  (action:exit).
+//    Alert condition: "Any alert() function call" → paste webhook URL.
+// ============================================================================
+
+//@version=6
+strategy("XSP Daily Lotto",
+         overlay            = true,
+         max_boxes_count    = 20,
+         max_labels_count   = 50,
+         default_qty_type   = strategy.fixed,
+         default_qty_value  = 200,
+         pyramiding         = 0,
+         calc_on_every_tick = false)
+
+// ── Input Groups ──────────────────────────────────────────────────────────────
+var string GRP_SENT = "Sentiment Symbol"
+var string GRP_LVLS = "Busby Levels"
+var string GRP_OR   = "Opening Range Entry"
+var string GRP_NEUT = "Neutral Channel Trade"
+var string GRP_EXIT = "Exit Settings"
+var string GRP_SES  = "Session"
+var string GRP_EXEC = "TradersPost"
+var string GRP_VIS  = "Visuals"
+
+// ── Sentiment Symbol ──────────────────────────────────────────────────────────
+string sentSymbol = input.symbol("CME_MINI:ES1!", "Sentiment Symbol",
+    tooltip = "Futures/ETF that drives bull/bear/neutral bias and supplies premarket range. " +
+              "XSP/SPY → ES1!.  IWM → M2K1!.  DIA → MYM1!.  NDX/QQQ → MNQ1!.",
+    group   = GRP_SENT)
+float sentThresh = input.float(0.10, "Neutral band (%)",
+    minval  = 0.0, maxval = 2.0, step = 0.05,
+    tooltip = "±% change from prior close.  Within band = neutral (yellow box).",
+    group   = GRP_SENT) / 100
+string tradeDir = input.string("Both", "Directional Filter",
+    options = ["Both", "Bull Only (Calls)", "Bear Only (Puts)"],
+    tooltip = "Both: sentiment picks direction (bull→calls, bear→puts).  " +
+              "Neutral days use the Neutral Channel Trade setting below.",
+    group   = GRP_SENT)
+
+// ── Busby Levels ──────────────────────────────────────────────────────────────
+bool  snapEnabled = input.bool(true, "Snap strikes to nearest option strike",
+    tooltip = "Rounds strike levels to ATR-derived grid (0.5 / 1 / 2.5 / 5 pt).  " +
+              "Trigger prices (OR boundaries) are NOT snapped.",
+    group   = GRP_LVLS)
+float lvl1Mult = input.float(0.25, "Extension 1 multiplier (× PM range)",
+    minval  = 0.05, step = 0.05,
+    tooltip = "Visual extension above PM_HIGH / below PM_LOW — chart reference only, not entry levels.",
+    group   = GRP_LVLS)
+float lvl2Mult = input.float(0.50, "Extension 2 multiplier (× PM range)",
+    minval  = 0.05, step = 0.05, group = GRP_LVLS)
+bool showOR  = input.bool(true, "Show Opening Range box", group = GRP_LVLS)
+int  orMins  = input.int(15, "Opening Range (minutes)",
+    options = [5, 10, 15, 30], group = GRP_LVLS)
+
+// ── Opening Range Entry ───────────────────────────────────────────────────────
+// After the OR closes:
+//   Bull: buy CALL at snap(orHigh) when price pulls back to orLow.
+//   Bear: buy PUT  at snap(orLow)  when price spikes up  to orHigh.
+// Strike is snapped; OR trigger levels are raw (no snap).
+float maxPremium = input.float(0.10, "Max option premium per share ($)",
+    minval  = 0.01, step = 0.01,
+    tooltip = "Debit cap per share.  Entry limit = strike ± this value.  " +
+              "Max loss = premium × 100 × contracts.",
+    group   = GRP_OR)
+float maxRiskDollars = input.float(20.0, "Max risk per trade ($)",
+    minval  = 5.0, step = 5.0,
+    tooltip = "Total dollar risk budget.  Contracts = floor(maxRisk ÷ (premium × 100)).  " +
+              "$20 at $0.10 premium → 2 contracts.  $20 at $0.05 → 4 contracts.",
+    group   = GRP_OR)
+int optMultiplier = input.int(100, "Contract multiplier (shares per contract)",
+    minval  = 1,
+    tooltip = "Standard US options = 100.  Mini options may differ.",
+    group   = GRP_OR)
+float tp1OptionPrice = input.float(1.00, "TP1 option price target ($)",
+    minval  = 0.05, step = 0.05,
+    tooltip = "Option value per share at T1.  Underlying must reach this many dollars past the OR strike.  " +
+              "$1.00 default: underlying moves $1 past orHigh (calls) or $1 below orLow (puts).  " +
+              "Busby PM_HIGH typically sits ~$1 above orHigh — validates this as the natural first target.  " +
+              "Backtesting showed $1.00 generates 5.8× more P&L than $0.50 over the same period.",
+    group   = GRP_OR)
+float tp2OptionPrice = input.float(1.50, "TP2 option price target ($)",
+    minval  = 0.05, step = 0.05,
+    tooltip = "Option value per share at T2.  Underlying must reach $1.50 past the OR boundary strike.  " +
+              "$0.50 gap above T1 gives the runner room without requiring extreme continuation moves.",
+    group   = GRP_OR)
+int maxPerDir = input.int(1, "Max entries per direction per day",
+    minval  = 1, maxval = 3,
+    tooltip = "Hard daily limit on call or put entries.",
+    group   = GRP_OR)
+
+// ── Neutral Channel Trade ─────────────────────────────────────────────────────
+bool  neutralEn      = input.bool(false, "Enable neutral channel trades",
+    tooltip = "ON: when sentiment is neutral, fade OR-boundary touches using the Busby Pivot as strike.  " +
+              "OFF: no trades on neutral days.  Turn OFF in trending markets; ON for range-bound sessions.",
+    group   = GRP_NEUT)
+float neutMaxPrem    = input.float(0.50, "Neutral max premium per share ($)",
+    minval  = 0.05, step = 0.05,
+    tooltip = "Higher than directional premium — pivot strike is closer to ATM.",
+    group   = GRP_NEUT)
+float neutRiskDollars = input.float(50.0, "Neutral max risk per trade ($)",
+    minval  = 5.0, step = 5.0,
+    tooltip = "At $0.50 premium, $50 → 1 contract.",
+    group   = GRP_NEUT)
+float neutTp1Price   = input.float(1.00, "Neutral TP1 option price ($)",
+    minval  = 0.05, step = 0.05, group = GRP_NEUT)
+float neutTp2Price   = input.float(1.50, "Neutral TP2 option price ($)",
+    minval  = 0.05, step = 0.05, group = GRP_NEUT)
+
+// ── Exit Settings ─────────────────────────────────────────────────────────────
+// Stop is always at the strike (option ATM = 0 intrinsic for 0DTE).
+// Max loss = maxPremium × optMultiplier × contracts.
+bool  tp1En       = input.bool(true, "Partial exit at T1", group = GRP_EXIT)
+float tp1Pct      = input.float(50.0, "T1 exit size (%)",
+    minval  = 10.0, maxval = 100.0, step = 10.0,
+    tooltip = "Percentage of position to close at T1.  Remainder runs to T2 or stop.",
+    group   = GRP_EXIT)
+bool  tp2En       = input.bool(true, "Final exit at T2", group = GRP_EXIT)
+bool  itmCheckEn  = input.bool(true, "Close if ITM before expiry",
+    tooltip = "At check window, close shallow-ITM positions to capture residual value.",
+    group   = GRP_EXIT)
+int   itmOffset   = input.int(30, "  Minutes before EOD to check",
+    minval  = 5, maxval = 60,
+    tooltip = "Default 30 = check at 3:15 when EOD is 3:45.",
+    group   = GRP_EXIT)
+bool  skipDeepItm = input.bool(true, "  Skip close if deep ITM (cash-settled hold)",
+    tooltip = "XSP/SPX are European cash-settled — no assignment risk.  Deep-ITM can settle safely.",
+    group   = GRP_EXIT)
+float deepItmPts  = input.float(2.0, "  Deep ITM threshold (points)",
+    minval  = 0.5, step = 0.5, group = GRP_EXIT)
+bool  eodEn       = input.bool(true, "EOD force-close",
+    tooltip = "OFF: let OTM options expire worthless — saves broker fee, avoids PDT day-trade count.",
+    group   = GRP_EXIT)
+int   eodHr       = input.int(15, "  EOD force-close hour (NY)",   minval = 12, maxval = 15, group = GRP_EXIT)
+int   eodMn       = input.int(45, "  EOD force-close minute (NY)", minval = 0,  maxval = 59, group = GRP_EXIT)
+
+// ── Session ───────────────────────────────────────────────────────────────────
+int entryLockHr = input.int(11, "No new entries after hour (NY)",
+    minval  = 9, maxval = 15,
+    tooltip = "Entries blocked at or after this NY hour.  Default 11 AM.",
+    group   = GRP_SES)
+int entryLockMn = input.int(30, "No new entries after minute (NY)",
+    minval  = 0, maxval = 59, group = GRP_SES)
+
+// ── TradersPost ───────────────────────────────────────────────────────────────
+bool useMarket = input.bool(true, "Use Market Orders",
+    tooltip = "ON: no price field (market order).  OFF: includes trigger price as reference.",
+    group   = GRP_EXEC)
+int tpQtyDir  = input.int(0, "Directional contracts to order (0 = auto)",
+    minval  = 0, maxval = 50,
+    tooltip = "Contracts sent in the TradersPost webhook JSON for CALL/PUT trades.  " +
+              "0 = use auto-sizing from Max Risk ÷ (Premium × 100).  " +
+              "At defaults ($20 risk, $0.10 premium) auto = 2 contracts.  " +
+              "Override here to pin a specific quantity regardless of risk inputs.",
+    group   = GRP_EXEC)
+int tpQtyNeut = input.int(0, "Neutral contracts to order (0 = auto)",
+    minval  = 0, maxval = 50,
+    tooltip = "Contracts sent in the TradersPost webhook JSON for neutral channel trades.  " +
+              "0 = use auto-sizing from Neutral Max Risk ÷ (Neutral Premium × 100).  " +
+              "At defaults ($50 risk, $0.50 premium) auto = 1 contract.",
+    group   = GRP_EXEC)
+string alertFmt = input.string("Toast", "Alert format",
+    options = ["Toast", "JSON (TradersPost)"],
+    tooltip = "Toast: plain-text notification for manual trading.  " +
+              "Shows option type, strike, contract count, and exact option prices to set in your broker (TP1/TP2 limit sell orders + stop reference).  " +
+              "JSON: TradersPost webhook format for automated order routing.",
+    group   = GRP_EXEC)
+
+// ── Visuals ───────────────────────────────────────────────────────────────────
+bool showLabels = input.bool(true, "Show OR label",     group = GRP_VIS)
+bool showStatus = input.bool(true, "Show status label", group = GRP_VIS)
+
+// ── Time Helpers (New York) ───────────────────────────────────────────────────
+int  nyH   = hour(time, "America/New_York")
+int  nyM   = minute(time, "America/New_York")
+int  nyMin = nyH * 60 + nyM
+
+bool isPM    = nyMin >= 240 and nyMin < 570       // 4:00 AM – 9:30 AM
+bool isMkt   = nyMin >= 570 and nyMin < 960       // 9:30 AM – 4:00 PM
+bool isOR    = isMkt and nyMin < (570 + orMins)
+bool pmStart = bar_index > 0 and isPM  and not isPM[1]
+bool mktOpen = bar_index > 0 and isMkt and not isMkt[1]
+bool orEnds  = bar_index > 0 and not isOR and isOR[1] and isMkt
+bool newDay  = ta.change(time("D")) != 0
+
+bool afterLock      = nyH > entryLockHr or (nyH == entryLockHr and nyM >= entryLockMn)
+bool isEod          = nyH > eodHr or (nyH == eodHr and nyM >= eodMn)
+bool inWindow       = isMkt and not afterLock and not isEod
+bool isItmCheckTime = isMkt and nyMin >= (eodHr * 60 + eodMn - itmOffset) and not isEod
+
+// ── Premarket Range (chart symbol) ───────────────────────────────────────────
+var float pmHigh  = na
+var float pmLow   = na
+var float pmClose = na
+
+if pmStart
+    pmHigh  := high
+    pmLow   := low
+    pmClose := close
+else if isPM
+    pmHigh  := math.max(nz(pmHigh, high), high)
+    pmLow   := math.min(nz(pmLow,  low),  low)
+    pmClose := close
+
+// ── Sentiment Symbol Premarket (fallback range source) ───────────────────────
+float sH15 = nz(request.security(sentSymbol, "15", high),  close)
+float sL15 = nz(request.security(sentSymbol, "15", low),   close)
+float sC15 = nz(request.security(sentSymbol, "15", close), close)
+
+var float sentPmHigh  = na
+var float sentPmLow   = na
+var float sentPmClose = na
+
+if pmStart
+    sentPmHigh  := sH15
+    sentPmLow   := sL15
+    sentPmClose := sC15
+else if isPM
+    sentPmHigh  := math.max(nz(sentPmHigh,  sH15), sH15)
+    sentPmLow   := math.min(nz(sentPmLow,   sL15), sL15)
+    sentPmClose := sC15
+
+// ── Opening Range Accumulation ────────────────────────────────────────────────
+var float orHigh     = na
+var float orLow      = na
+var int   orStartBar = na
+
+if mktOpen
+    orHigh     := high
+    orLow      := low
+    orStartBar := bar_index
+else if isOR
+    orHigh := math.max(nz(orHigh, high), high)
+    orLow  := math.min(nz(orLow,  low),  low)
+
+// ── Sentiment Calculation ─────────────────────────────────────────────────────
+float sentNow = nz(request.security(sentSymbol, "15", close),    close)
+float sentPrv = nz(request.security(sentSymbol, "D",  close[1]), sentNow)
+float sentPct = sentPrv > 0 ? (sentNow - sentPrv) / sentPrv : 0.0
+bool  isBull  = sentPct >  sentThresh
+bool  isBear  = sentPct < -sentThresh
+bool  isNeut  = not isBull and not isBear
+
+color sentFill   = isBull ? color.new(color.green,  85) : isBear ? color.new(color.red,    85) : color.new(color.yellow, 85)
+color sentBorder = isBull ? color.green : isBear ? color.red : color.yellow
+string sentText  = isBull ? "BULL" : isBear ? "BEAR" : "NEUTRAL"
+
+// ── Prior Day Fallback ────────────────────────────────────────────────────────
+float xD_H = nz(request.security(syminfo.tickerid, "D", high[1]),  close)
+float xD_L = nz(request.security(syminfo.tickerid, "D", low[1]),   close)
+float xD_C = nz(request.security(syminfo.tickerid, "D", close[1]), close)
+
+// ── Strike Snap ───────────────────────────────────────────────────────────────
+float xspATR  = nz(request.security(syminfo.tickerid, "D", ta.atr(14)), 5.0)
+float snapInt = xspATR < 4.0 ? 0.5 : xspATR < 8.0 ? 1.0 : xspATR < 15.0 ? 2.5 : 5.0
+snap(v) => snapEnabled ? math.round(v / snapInt) * snapInt : v
+
+// ── Lock Busby Levels at Market Open ──────────────────────────────────────────
+// PM HIGH / PM LOW / Pivot are locked at 9:30 AM.
+// These serve as chart reference and TP validation — NOT as entry strikes.
+// Entry strikes come from the OR box (locked when OR closes).
+var float lockedPivot = na
+var float lockedHigh  = na
+var float lockedLow   = na
+var float lockedRange = na
+
+if mktOpen
+    bool  hasXSP  = not na(pmHigh)     and pmHigh     > nz(pmLow,    pmHigh)
+    bool  hasSent = not na(sentPmHigh) and sentPmHigh > nz(sentPmLow, sentPmHigh)
+    float sScale  = sentPmClose > 0 ? close / sentPmClose : 1.0
+    float h = hasXSP ? pmHigh  : hasSent ? sentPmHigh * sScale : xD_H
+    float l = hasXSP ? pmLow   : hasSent ? sentPmLow  * sScale : xD_L
+    float c = hasXSP ? pmClose : hasSent ? close : xD_C
+    lockedPivot := snap((h + l + c) / 3)
+    lockedHigh  := snap(h)
+    lockedLow   := snap(l)
+    lockedRange := h - l
+
+lockedPivot := nz(lockedPivot, snap((xD_H + xD_L + xD_C) / 3))
+lockedHigh  := nz(lockedHigh,  snap(xD_H))
+lockedLow   := nz(lockedLow,   snap(xD_L))
+lockedRange := math.max(nz(lockedRange, xD_H - xD_L), syminfo.mintick)
+
+// ── Busby Extensions (chart reference only) ───────────────────────────────────
+float t2up = snap(lockedHigh + lockedRange * lvl2Mult)
+float t1up = snap(lockedHigh + lockedRange * lvl1Mult)
+float t1dn = snap(lockedLow  - lockedRange * lvl1Mult)
+float t2dn = snap(lockedLow  - lockedRange * lvl2Mult)
+
+// ── OR Formed Gate ────────────────────────────────────────────────────────────
+// orHigh and orLow are the raw (un-snapped) OR boundaries — these ARE the
+// entry trigger levels.  Strikes are snap(orHigh) / snap(orLow) / snap(pivot).
+bool orFormed = not na(orLow) and not isOR and isMkt
+
+// ── Contract Sizing from Max Risk ─────────────────────────────────────────────
+// Directional:  floor(maxRiskDollars  / (maxPremium  × optMultiplier))
+// Neutral:      floor(neutRiskDollars / (neutMaxPrem  × optMultiplier))
+int  dirContracts  = math.max(1, int(math.floor(maxRiskDollars   / (maxPremium  * float(optMultiplier)))))
+int  neutContracts = math.max(1, int(math.floor(neutRiskDollars  / (neutMaxPrem * float(optMultiplier)))))
+int  dirQty        = dirContracts  * optMultiplier
+int  neutQty       = neutContracts * optMultiplier
+
+// ── Daily Trade Counters ──────────────────────────────────────────────────────
+var int  bullCount     = 0
+var int  bearCount     = 0
+var int  neutCount     = 0
+var bool itmCheckFired = false
+
+if newDay
+    bullCount     := 0
+    bearCount     := 0
+    neutCount     := 0
+    itmCheckFired := false
+
+// ── Direction Gates ───────────────────────────────────────────────────────────
+// Directional gates respect tradeDir setting but NOT neutral — neutral is
+// handled exclusively through canNeut / neutralEn.
+bool dirBull = tradeDir == "Bull Only (Calls)" or (tradeDir == "Both" and isBull)
+bool dirBear = tradeDir == "Bear Only (Puts)"  or (tradeDir == "Both" and isBear)
+
+bool noPosition = strategy.position_size == 0
+
+// Directional entries: require confirmed bull/bear sentiment + OR formed.
+bool canBull = inWindow and noPosition and dirBull and bullCount < maxPerDir and orFormed
+bool canBear = inWindow and noPosition and dirBear and bearCount < maxPerDir and orFormed
+
+// Neutral entry: requires neutral sentiment, toggle on, ≤1 neutral trade/day.
+bool canNeut = inWindow and noPosition and isNeut and neutralEn and neutCount < 1 and orFormed
+
+// ── Entry Trigger Conditions ──────────────────────────────────────────────────
+// Bull  : price pulls back DOWN to OR low  → buy call at snap(orHigh)
+// Bear  : price spikes UP   to OR high     → buy put  at snap(orLow)
+// Neut↑ : first bottom touch               → buy call at snap(lockedPivot)
+// Neut↓ : first top touch                  → buy put  at snap(lockedPivot)
+// Trigger prices use raw orLow/orHigh (no snap).
+float orLowRef  = nz(orLow,  lockedLow)
+float orHighRef = nz(orHigh, lockedHigh)
+
+bool goLong      = canBull and low  <= orLowRef
+bool goShort     = canBear and high >= orHighRef
+bool goNeutLong  = canNeut and low  <= orLowRef    // bottom touch → call at pivot
+bool goNeutShort = canNeut and high >= orHighRef and not goNeutLong  // top touch → put at pivot (not same bar as bottom)
+
+// ── Persistent Exit Levels (set at entry, held until close) ───────────────────
+var float exitTP1   = na
+var float exitTP2   = na
+var float exitStop  = na
+var float entryStrk = na
+
+// ── TradersPost Quantity Resolution ──────────────────────────────────────────
+// Auto-sizing uses the same formula as dirContracts / neutContracts.
+// Override inputs (> 0) pin a fixed quantity in the webhook/toast only —
+// the backtest position sizing is unchanged (always uses dirQty / neutQty).
+int webhookDirQty  = tpQtyDir  > 0 ? tpQtyDir  : dirContracts
+int webhookNeutQty = tpQtyNeut > 0 ? tpQtyNeut : neutContracts
+
+// Pre-split quantities for alert messages (reflects the 50%/50% T1/T2 ladder).
+int alertTp1Qty  = math.max(1, math.round(webhookDirQty  * tp1Pct / 100.0))
+int alertTp2Qty  = math.max(0, webhookDirQty  - alertTp1Qty)
+int alertNTp1Qty = math.max(1, math.round(webhookNeutQty * tp1Pct / 100.0))
+int alertNTp2Qty = math.max(0, webhookNeutQty - alertNTp1Qty)
+
+// ── Entry Orders ──────────────────────────────────────────────────────────────
+string exitJson = '{"ticker":"' + syminfo.ticker + '","action":"exit"}'
+
+// BULL CALL: strike = snap(orHigh), trigger = pullback to orLow.
+// LONG limit at (strike + maxPremium) fills immediately because
+// price at orLow < orHigh = strike < strike + maxPremium.
+if goLong
+    bullCount := bullCount + 1
+    entryStrk := snap(orHighRef)
+    exitTP1   := entryStrk + tp1OptionPrice
+    exitTP2   := entryStrk + tp2OptionPrice
+    exitStop  := entryStrk
+    string cs   = str.tostring(entryStrk, "#.##")
+    string bT   = "BULL CALL | Buy " + str.tostring(webhookDirQty) + "x XSP " + cs + "C" +
+                  " | TP1 sell " + str.tostring(alertTp1Qty) + " @$" + str.tostring(tp1OptionPrice, "#.##") + " opt" +
+                  " | TP2 sell " + str.tostring(alertTp2Qty) + " @$" + str.tostring(tp2OptionPrice, "#.##") + " opt" +
+                  " | Stop: ul <= " + cs
+    string bB   = '{"ticker":"' + syminfo.ticker + '","action":"buy","sentiment":"bullish","optionType":"call","strike":' + cs + ',"expiry":"0DTE","quantity":' + str.tostring(webhookDirQty) + '}'
+    string bL   = '{"ticker":"' + syminfo.ticker + '","action":"buy","sentiment":"bullish","optionType":"call","strike":' + cs + ',"expiry":"0DTE","price":"' + str.tostring(orLowRef, format.mintick) + '","quantity":' + str.tostring(webhookDirQty) + '}'
+    strategy.entry("Long", strategy.long, qty = dirQty, limit = entryStrk + maxPremium, comment = "CALL@" + cs)
+    alert(alertFmt == "Toast" ? bT : useMarket ? bB : bL, alert.freq_once_per_bar)
+
+// BEAR PUT: strike = snap(orLow), trigger = spike to orHigh.
+// SHORT limit at (strike - maxPremium) fills immediately because
+// price at orHigh > orLow = strike > strike - maxPremium.
+if goShort
+    bearCount := bearCount + 1
+    entryStrk := snap(orLowRef)
+    exitTP1   := entryStrk - tp1OptionPrice
+    exitTP2   := entryStrk - tp2OptionPrice
+    exitStop  := entryStrk
+    string ps   = str.tostring(entryStrk, "#.##")
+    string sT   = "BEAR PUT | Buy " + str.tostring(webhookDirQty) + "x XSP " + ps + "P" +
+                  " | TP1 sell " + str.tostring(alertTp1Qty) + " @$" + str.tostring(tp1OptionPrice, "#.##") + " opt" +
+                  " | TP2 sell " + str.tostring(alertTp2Qty) + " @$" + str.tostring(tp2OptionPrice, "#.##") + " opt" +
+                  " | Stop: ul >= " + ps
+    string sB   = '{"ticker":"' + syminfo.ticker + '","action":"sell","sentiment":"bearish","optionType":"put","strike":' + ps + ',"expiry":"0DTE","quantity":' + str.tostring(webhookDirQty) + '}'
+    string sL   = '{"ticker":"' + syminfo.ticker + '","action":"sell","sentiment":"bearish","optionType":"put","strike":' + ps + ',"expiry":"0DTE","price":"' + str.tostring(orHighRef, format.mintick) + '","quantity":' + str.tostring(webhookDirQty) + '}'
+    strategy.entry("Short", strategy.short, qty = dirQty, limit = entryStrk - maxPremium, comment = "PUT@" + ps)
+    alert(alertFmt == "Toast" ? sT : useMarket ? sB : sL, alert.freq_once_per_bar)
+
+// NEUTRAL CALL: first OR bottom touch → BTO CALL at Busby pivot strike.
+if goNeutLong
+    neutCount := neutCount + 1
+    entryStrk := snap(lockedPivot)
+    exitTP1   := entryStrk + neutTp1Price
+    exitTP2   := entryStrk + neutTp2Price
+    exitStop  := entryStrk
+    string ncs  = str.tostring(entryStrk, "#.##")
+    string nBT  = "NEUT CALL | Buy " + str.tostring(webhookNeutQty) + "x XSP " + ncs + "C (pivot)" +
+                  " | TP1 sell " + str.tostring(alertNTp1Qty) + " @$" + str.tostring(neutTp1Price, "#.##") + " opt" +
+                  " | TP2 sell " + str.tostring(alertNTp2Qty) + " @$" + str.tostring(neutTp2Price, "#.##") + " opt" +
+                  " | Stop: ul <= " + ncs
+    string nB   = '{"ticker":"' + syminfo.ticker + '","action":"buy","sentiment":"neutral","optionType":"call","strike":' + ncs + ',"expiry":"0DTE","quantity":' + str.tostring(webhookNeutQty) + '}'
+    strategy.entry("NeutLong", strategy.long, qty = neutQty, limit = entryStrk + neutMaxPrem, comment = "NCALL@" + ncs)
+    alert(alertFmt == "Toast" ? nBT : nB, alert.freq_once_per_bar)
+
+// NEUTRAL PUT: first OR top touch → BTO PUT at Busby pivot strike.
+if goNeutShort
+    neutCount := neutCount + 1
+    entryStrk := snap(lockedPivot)
+    exitTP1   := entryStrk - neutTp1Price
+    exitTP2   := entryStrk - neutTp2Price
+    exitStop  := entryStrk
+    string nps  = str.tostring(entryStrk, "#.##")
+    string nST  = "NEUT PUT | Buy " + str.tostring(webhookNeutQty) + "x XSP " + nps + "P (pivot)" +
+                  " | TP1 sell " + str.tostring(alertNTp1Qty) + " @$" + str.tostring(neutTp1Price, "#.##") + " opt" +
+                  " | TP2 sell " + str.tostring(alertNTp2Qty) + " @$" + str.tostring(neutTp2Price, "#.##") + " opt" +
+                  " | Stop: ul >= " + nps
+    string nS   = '{"ticker":"' + syminfo.ticker + '","action":"sell","sentiment":"neutral","optionType":"put","strike":' + nps + ',"expiry":"0DTE","quantity":' + str.tostring(webhookNeutQty) + '}'
+    strategy.entry("NeutShort", strategy.short, qty = neutQty, limit = entryStrk - neutMaxPrem, comment = "NPUT@" + nps)
+    alert(alertFmt == "Toast" ? nST : nS, alert.freq_once_per_bar)
+
+// ── Cancel Pending Entries After Entry Lock ───────────────────────────────────
+if afterLock and not afterLock[1]
+    strategy.cancel_all()
+
+// ── Exit Orders ───────────────────────────────────────────────────────────────
+// Stop always at the strike — option ATM = 0 intrinsic, worth less than premium.
+// Each from_entry targets only its matching entry (pyramiding=0 keeps one open).
+if strategy.position_size > 0
+    float sl = not na(exitStop) ? exitStop : na
+    if tp1En and tp2En
+        strategy.exit("Long TP1",  from_entry = "Long",      qty_percent = tp1Pct, limit = exitTP1,           comment_profit = "T1")
+        strategy.exit("Long TP2",  from_entry = "Long",                             limit = exitTP2, stop = sl, comment_profit = "T2", comment_loss = "Stop@Strike")
+        strategy.exit("NL TP1",    from_entry = "NeutLong",  qty_percent = tp1Pct, limit = exitTP1,           comment_profit = "T1")
+        strategy.exit("NL TP2",    from_entry = "NeutLong",                         limit = exitTP2, stop = sl, comment_profit = "T2", comment_loss = "Stop@Strike")
+    else if tp1En
+        strategy.exit("Long TP1",  from_entry = "Long",      limit = exitTP1, stop = sl, comment_profit = "T1", comment_loss = "Stop@Strike")
+        strategy.exit("NL TP1",    from_entry = "NeutLong",  limit = exitTP1, stop = sl, comment_profit = "T1", comment_loss = "Stop@Strike")
+    else if tp2En
+        strategy.exit("Long TP2",  from_entry = "Long",      limit = exitTP2, stop = sl, comment_profit = "T2", comment_loss = "Stop@Strike")
+        strategy.exit("NL TP2",    from_entry = "NeutLong",  limit = exitTP2, stop = sl, comment_profit = "T2", comment_loss = "Stop@Strike")
+    else
+        strategy.exit("Long Stop", from_entry = "Long",      stop = sl, comment_loss = "Stop@Strike")
+        strategy.exit("NL Stop",   from_entry = "NeutLong",  stop = sl, comment_loss = "Stop@Strike")
+
+if strategy.position_size < 0
+    float sl = not na(exitStop) ? exitStop : na
+    if tp1En and tp2En
+        strategy.exit("Short TP1", from_entry = "Short",     qty_percent = tp1Pct, limit = exitTP1,           comment_profit = "T1")
+        strategy.exit("Short TP2", from_entry = "Short",                            limit = exitTP2, stop = sl, comment_profit = "T2", comment_loss = "Stop@Strike")
+        strategy.exit("NS TP1",    from_entry = "NeutShort", qty_percent = tp1Pct, limit = exitTP1,           comment_profit = "T1")
+        strategy.exit("NS TP2",    from_entry = "NeutShort",                        limit = exitTP2, stop = sl, comment_profit = "T2", comment_loss = "Stop@Strike")
+    else if tp1En
+        strategy.exit("Short TP1", from_entry = "Short",     limit = exitTP1, stop = sl, comment_profit = "T1", comment_loss = "Stop@Strike")
+        strategy.exit("NS TP1",    from_entry = "NeutShort", limit = exitTP1, stop = sl, comment_profit = "T1", comment_loss = "Stop@Strike")
+    else if tp2En
+        strategy.exit("Short TP2", from_entry = "Short",     limit = exitTP2, stop = sl, comment_profit = "T2", comment_loss = "Stop@Strike")
+        strategy.exit("NS TP2",    from_entry = "NeutShort", limit = exitTP2, stop = sl, comment_profit = "T2", comment_loss = "Stop@Strike")
+    else
+        strategy.exit("Short Stop", from_entry = "Short",     stop = sl, comment_loss = "Stop@Strike")
+        strategy.exit("NS Stop",    from_entry = "NeutShort", stop = sl, comment_loss = "Stop@Strike")
+
+// ── ITM-30 Check ─────────────────────────────────────────────────────────────
+float itmDepth = strategy.position_size > 0 and not na(entryStrk) ? close - entryStrk : strategy.position_size < 0 and not na(entryStrk) ? entryStrk - close : 0.0
+bool  posIsItm = itmDepth > 0.0
+
+if itmCheckEn and isItmCheckTime and not itmCheckFired and strategy.position_size != 0
+    itmCheckFired := true
+    bool holdForCash = skipDeepItm and itmDepth >= deepItmPts
+    if posIsItm and not holdForCash
+        strategy.close_all(comment = "ITM-30")
+
+// ── EOD Force-Close ───────────────────────────────────────────────────────────
+if eodEn and isEod and strategy.position_size != 0
+    strategy.cancel_all()
+    strategy.close_all(comment = "EOD")
+
+// ── Exit Alert ────────────────────────────────────────────────────────────────
+// Fires one bar after the close (Pine queues strategy commands to bar-close).
+// exit_comment() reads the comment set in strategy.exit() / strategy.close_all().
+// Covers T1, T2, Stop@Strike, ITM-30, and EOD in a single unified path.
+var int prevClosed = 0
+if strategy.closedtrades > prevClosed
+    prevClosed := strategy.closedtrades
+    string ec  = strategy.closedtrades.exit_comment(strategy.closedtrades - 1)
+    string sk  = str.tostring(nz(entryStrk, 0.0), "#.##")
+    string tp1s = str.tostring(tp1OptionPrice, "#.##")
+    string tp2s = str.tostring(tp2OptionPrice, "#.##")
+    string exitTst = ec == "T1"          ? "T1 HIT XSP " + sk + " | ~$" + tp1s + " fill | TP2 @$" + tp2s + " still working" :
+                     ec == "T2"          ? "T2 HIT XSP " + sk + " | ~$" + tp2s + " fill | Trade complete" :
+                     ec == "Stop@Strike" ? "STOP XSP " + sk + " | Strike broken | Exit remaining at market" :
+                     ec == "ITM-30"      ? "ITM-30 XSP " + sk + " | In the money — closed for residual value" :
+                     ec == "EOD"         ? "EOD XSP " + sk + " | Session force-close" :
+                     "XSP EXIT | " + ec
+    alert(alertFmt == "Toast" ? exitTst : exitJson, alert.freq_once_per_bar)
+
+// ── Premarket Box ─────────────────────────────────────────────────────────────
+var box pmBox = na
+if pmStart
+    box.delete(pmBox)
+    pmBox := box.new(bar_index, high, bar_index + 1, low, bgcolor = sentFill, border_color = sentBorder, border_width = 1)
+if (isPM or isMkt) and not na(pmBox)
+    box.set_top(pmBox,          nz(pmHigh, high))
+    box.set_bottom(pmBox,       nz(pmLow,  low))
+    box.set_right(pmBox,        bar_index + 1)
+    box.set_bgcolor(pmBox,      sentFill)
+    box.set_border_color(pmBox, sentBorder)
+
+// ── Opening Range Box ─────────────────────────────────────────────────────────
+var box orBox = na
+if orEnds and showOR
+    box.delete(orBox)
+    color orFill   = isBull ? color.new(color.teal, 80) : isBear ? color.new(color.maroon, 80) : color.new(color.gray, 80)
+    color orBorder = isBull ? color.teal : isBear ? color.maroon : color.gray
+    orBox := box.new(nz(orStartBar, bar_index), nz(orHigh, high), bar_index, nz(orLow, low), bgcolor = orFill, border_color = orBorder, border_width = 1, border_style = line.style_dashed)
+
+// ── OR Close Label (appears when OR locks — levels known) ─────────────────────
+// Fires at orEnds so OR high/low are confirmed.  Shows strikes, triggers, TPs.
+var label openLabel = na
+if orEnds and showLabels
+    label.delete(openLabel)
+    string callStrk = str.tostring(snap(orHighRef), "#.##")
+    string putStrk  = str.tostring(snap(orLowRef),  "#.##")
+    string orHStr   = str.tostring(orHighRef, "#.##")
+    string orLStr   = str.tostring(orLowRef,  "#.##")
+    string pivStr   = str.tostring(snap(lockedPivot), "#.##")
+    string cT1      = str.tostring(snap(orHighRef) + tp1OptionPrice, "#.##")
+    string cT2      = str.tostring(snap(orHighRef) + tp2OptionPrice, "#.##")
+    string pT1      = str.tostring(snap(orLowRef)  - tp1OptionPrice, "#.##")
+    string pT2      = str.tostring(snap(orLowRef)  - tp2OptionPrice, "#.##")
+    string ln1 = sentText + "  |  Pivot: " + str.tostring(lockedPivot, "#.##") + "  OR: [" + orLStr + " – " + orHStr + "]  max $" + str.tostring(maxPremium, "#.##")
+    string ln2 = "BULL CALL@" + callStrk + "  trigger pull-back <= " + orLStr + "  TP1@" + cT1 + " ($" + str.tostring(tp1OptionPrice, "#.##") + ")  TP2@" + cT2 + " ($" + str.tostring(tp2OptionPrice, "#.##") + ")"
+    string ln3 = "BEAR PUT@"  + putStrk  + "  trigger spike    >= " + orHStr + "  TP1@" + pT1 + " ($" + str.tostring(tp1OptionPrice, "#.##") + ")  TP2@" + pT2 + " ($" + str.tostring(tp2OptionPrice, "#.##") + ")"
+    string ln4 = "NEUTRAL CALL/PUT@" + pivStr + "  first OR touch  |  TP1/TP2: $" + str.tostring(neutTp1Price, "#.##") + " / $" + str.tostring(neutTp2Price, "#.##")
+    color  lc  = isBull ? color.green : isBear ? color.red : color.orange
+    string labelTxt = neutralEn ? ln1 + "\n" + ln2 + "\n" + ln3 + "\n" + ln4 : ln1 + "\n" + ln2 + "\n" + ln3
+    openLabel := label.new(bar_index, orHighRef, labelTxt, color = lc, textcolor = color.white, style = label.style_label_down, size = size.small)
+
+// ── Plots ─────────────────────────────────────────────────────────────────────
+// Busby levels — PM range structure, chart reference (not entry strikes).
+plot(t2up,        "Ext 2 ↑",    color = color.green,                linewidth = 2)
+plot(t1up,        "Ext 1 ↑",    color = color.new(color.green, 30))
+plot(lockedHigh,  "Busby PM H", color = color.new(color.aqua,  20), linewidth = 1)
+plot(lockedPivot, "Pivot",      color = color.yellow,               linewidth = 2)
+plot(lockedLow,   "Busby PM L", color = color.new(color.aqua,  20), linewidth = 1)
+plot(t1dn,        "Ext 1 ↓",    color = color.new(color.red,   30))
+plot(t2dn,        "Ext 2 ↓",    color = color.red,                  linewidth = 2)
+
+// OR boundary levels — these ARE the entry triggers (raw, un-snapped).
+// Bull pullback fires when price ≤ OR low.  Bear spike fires when price ≥ OR high.
+plot(orFormed ? orLowRef  : na, "OR Low  (Bull Trigger)", color = color.new(color.lime,   45), linewidth = 2, style = plot.style_linebr)
+plot(orFormed ? orHighRef : na, "OR High (Bear Trigger)", color = color.new(color.orange, 45), linewidth = 2, style = plot.style_linebr)
+
+// Option-price TP levels anchored to OR strike boundaries — actual exit triggers.
+// Bull: call strike = snap(orHigh), so TP lines are snap(orHigh) + option targets.
+// Bear: put  strike = snap(orLow),  so TP lines are snap(orLow)  - option targets.
+plot(orFormed ? snap(orHighRef) + tp1OptionPrice : na, "Call TP1", color = color.new(color.green, 40), linewidth = 1, style = plot.style_linebr)
+plot(orFormed ? snap(orHighRef) + tp2OptionPrice : na, "Call TP2", color = color.new(color.green, 10), linewidth = 2, style = plot.style_linebr)
+plot(orFormed ? snap(orLowRef)  - tp1OptionPrice : na, "Put  TP1", color = color.new(color.red,   40), linewidth = 1, style = plot.style_linebr)
+plot(orFormed ? snap(orLowRef)  - tp2OptionPrice : na, "Put  TP2", color = color.new(color.red,   10), linewidth = 2, style = plot.style_linebr)
+
+bgcolor(close > lockedPivot ? color.new(color.green, 93) : close < lockedPivot ? color.new(color.red, 93) : na)
+
+// ── Status Label ──────────────────────────────────────────────────────────────
+var label statusLabel = na
+if barstate.islast and showStatus
+    label.delete(statusLabel)
+    string orHStr2  = orFormed ? str.tostring(orHighRef, "#.##") : "pending"
+    string orLStr2  = orFormed ? str.tostring(orLowRef,  "#.##") : "pending"
+    string cStrk    = orFormed ? str.tostring(snap(orHighRef), "#.##") : "pending"
+    string pStrk    = orFormed ? str.tostring(snap(orLowRef),  "#.##") : "pending"
+    string bFired   = bullCount > 0 ? "FIRED (" + str.tostring(bullCount) + ")" : "ready"
+    string eFired   = bearCount > 0 ? "FIRED (" + str.tostring(bearCount) + ")" : "ready"
+    string nFired   = neutCount > 0 ? "FIRED" : neutralEn ? "armed" : "OFF"
+    int    tp1Qty   = math.max(1, math.round(dirContracts * tp1Pct / 100.0))
+    int    tp2Qty   = dirContracts - tp1Qty
+    float  maxLoss  = maxPremium      * optMultiplier * dirContracts
+    float  tp1Gain  = (tp1OptionPrice - maxPremium) * optMultiplier * tp1Qty
+    float  tp2Gain  = (tp2OptionPrice - maxPremium) * optMultiplier * tp2Qty
+    float  fullWin  = tp1Gain + tp2Gain
+    string ln1 = "XSP Daily Lotto v2  |  Bias: " + sentText + "  (" + sentSymbol + ")"
+    string ln2 = "CALL@" + cStrk + "  trigger: pull-back ≤ " + orLStr2 + "  |  " + bFired
+    string ln3 = "PUT@"  + pStrk + "  trigger: spike    ≥ " + orHStr2 + "  |  " + eFired
+    string ln4 = "NEUTRAL@" + str.tostring(snap(lockedPivot), "#.##") + "  first OR touch  |  " + nFired
+    string ln5 = str.tostring(dirContracts) + " dir contracts ($" + str.tostring(maxRiskDollars, "#") + " risk)  |  " + str.tostring(neutContracts) + " neut contracts ($" + str.tostring(neutRiskDollars, "#") + " risk)"
+    string ln6 = "P&L: loss=$-" + str.tostring(maxLoss, "#") + "  TP1=$+" + str.tostring(tp1Gain, "#") + " ($" + str.tostring(tp1OptionPrice, "#.##") + ")  TP2=$+" + str.tostring(tp2Gain, "#") + " ($" + str.tostring(tp2OptionPrice, "#.##") + ")  full=$+" + str.tostring(fullWin, "#")
+    string eodStr   = eodEn ? "force-close @ " + str.tostring(eodHr) + ":" + (eodMn < 10 ? "0" : "") + str.tostring(eodMn) + " NY" : "OFF (let expire)"
+    int    itmH     = (eodHr * 60 + eodMn - itmOffset) / 60
+    int    itmM     = (eodHr * 60 + eodMn - itmOffset) % 60
+    string itmStr   = str.tostring(itmH) + ":" + (itmM < 10 ? "0" : "") + str.tostring(itmM)
+    string itmStatus = not itmCheckEn ? "OFF" : itmCheckFired ? (posIsItm ? "CLOSED ITM (" + str.tostring(itmDepth, "#.##") + "pt)" : "checked — OTM") : "armed @ " + itmStr + " NY"
+    string ln7 = "Window: " + (inWindow ? "OPEN" : afterLock ? "locked (entry cutoff)" : isEod ? "EOD zone" : "outside session") + "   EOD: " + eodStr
+    string ln8 = "ITM-30: " + itmStatus + (skipDeepItm ? "   deep-ITM hold ≥ " + str.tostring(deepItmPts, "#.##") + "pt" : "")
+    color  sCol = isBull ? color.new(color.green, 30) : isBear ? color.new(color.maroon, 20) : color.new(color.navy, 20)
+    statusLabel := label.new(bar_index, high, ln1 + "\n" + ln2 + "\n" + ln3 + "\n" + ln4 + "\n" + ln5 + "\n" + ln6 + "\n" + ln7 + "\n" + ln8, xloc = xloc.bar_index, yloc = yloc.abovebar, style = label.style_label_left, color = sCol, textcolor = color.white, size = size.small)

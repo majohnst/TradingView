@@ -90,19 +90,44 @@ Multi-line ternary chains (`a ? b :\n c ? d : e`) cause silent compile failures 
 
 | File | Description |
 |---|---|
-| `MES_XSP Busby Style Pivot Predictor.pine` | Main indicator — paste into TradingView Pine Editor |
+| `MES_XSP Busby Style Pivot Predictor.pine` | Busby Pivot indicator — paste into TradingView Pine Editor |
+| `XSP_Daily_Lotto_Strategy.pine` | Daily Lotto 0DTE strategy — paste into TradingView Pine Editor |
 | `MES_XSP Busby Pivot - HANDOFF.md` | This file |
 
 ## Repo
 `https://github.com/majohnst/TradingView.git` — branch `main`
 
-Last commit: `6c3d07b` — "Redesign Busby pivot: fix level anchoring, add MES premarket range, OR box, open label"
+Last commit: `44e1848` — "Revert TP1 to fixed $1.00 price input — remove tp1PremMult"
 
 ---
 
 ## Next iteration ideas (post live-test)
-- Tune level multipliers based on observed T1/T2 hit rate
-- Add premarket MES range accumulation using 1-min data for tighter precision
+- Tune `tp1OptionPrice` / `tp2OptionPrice` based on observed OR-range sizes — verify Busby PM_HIGH ≈ OR_high + $1 holds on live sessions
+- Collect data on bear-day spike-to-OR-high frequency vs bull-day pullback-to-OR-low frequency to confirm positive expectancy ratio
+- Add optional alerts: price crossing Call TP1/TP2 or Put TP1/TP2 for manual trim notification
 - Consider showing nearest 2–3 round-number strikes (5-pt handles) as static gamma reference lines
-- Evaluate whether the OR box color should lock at OR close rather than updating with live MES sentiment
-- Add optional alerts: price crossing T1↑/T2↑ (bull trim) or T1↓/T2↓ (bear trim)
+
+---
+
+## v3 Bear Market Notes (future — do not build yet)
+
+Current strategy is intentionally optimised for a bull-market regime.  Bear-day losses (~$20/day) are the "lotto ticket subscription cost" for staying in the game on the 4 bull days/week that generate $30–$330 returns.
+
+When regime shifts to sustained downtrend, the following will need recalibration:
+
+| Parameter | Bull market (now) | Bear market (v3) |
+|---|---|---|
+| `maxPremium` | $0.10 | $0.20–$0.30 (VIX elevated, spreads wider) |
+| `tp1OptionPrice` | $1.00 | $1.50–$2.00 (larger required moves) |
+| `sentThresh` | 0.10% | 0.20–0.30% (ES persistently negative) |
+| `tradeDir` | Both | Bear Only (Puts) as interim step |
+| Entry trigger | Bull: pullback to OR low (fires daily) | Bear: gap-down dead-cat-bounce to OR high (becomes the reliable signal) |
+| OR range expectation | 1–3 pt normal | 5–10 pt on elevated VIX |
+
+**Interim bear-regime setting change** (before v3 rebuild):
+1. Flip `tradeDir` → `Bear Only (Puts)`
+2. Raise `maxPremium` to `0.25`
+3. Raise `tp1OptionPrice` to `1.50`, `tp2OptionPrice` to `3.00`
+4. Widen `sentThresh` to `0.25%`
+
+Rebuild as v3 only when those interim settings produce consistently mis-sized fills or the OR trigger logic visibly breaks down.
