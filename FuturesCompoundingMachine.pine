@@ -44,6 +44,24 @@
 //    When a reversal fires (e.g., short closes and long opens on the same bar),
 //    compound/halt state updates one bar later due to Pine Script bar-close
 //    order sequencing. The TP limit self-corrects the following bar.
+//
+//  CHANGELOG:
+//    v2 — Jun 2026 (live validation review):
+//      1. calc_on_every_tick remains false: tick-by-tick eval was tested but caused
+//         immediate exits on MYM — $10 hard stop (20 pts) fires on normal intrabar
+//         noise. Native NT bracket stop via stopPrice in alert handles tick-level
+//         protection instead; TV simulation stays bar-close only.
+//      2. Stop price in entry alerts: entry JSON now includes "stopPrice" so
+//         TradersPost can place a native bracket stop in NinjaTrader at fill time.
+//         NinjaTrader no longer depends solely on TradingView webhook delivery to
+//         protect the position.
+//      3. Pre-market hard floor: entries blocked before PRE_MARKET_FLOOR (07:00 CT)
+//         regardless of sessionStartHr input. Orange warning label fires when the
+//         chart is in pre-market hours.
+//      4. MYM sizing ladder slowed: sizeUpEvery $50→$100, sizeDownEvery $50→$75.
+//         Reached 4 contracts in 3 days at $50 — too aggressive for live validation.
+//      5. MES pivot stop enabled: gives MES a structural stop level for the broker
+//         bracket order rather than relying solely on the R:R gate.
 // ============================================================================
 
 //@version=6
@@ -144,14 +162,20 @@ getConfig(string root) =>
         cfg.apexMode   := "Structure (BOS/CHoCH)"
         cfg.apexPeriod := 9
         cfg.apexTf     := "120"
-        // Position Sizing — validated Oct 2025–May 2026: $50/$50/max+3 (UDT defaults)
-        cfg.autoSize   := true
+        // Position Sizing — slowed Jun 2026: $100 up / $75 down / max+3.
+        // Was $50/$50 (UDT defaults) — reached 4 contracts in 3 live days.
+        // Conservative until stop architecture confirmed reliable.
+        cfg.autoSize      := true
+        cfg.sizeUpEvery   := 100.0
+        cfg.sizeDownEvery := 75.0
     else if root == "MES"
         // Signal Filters
         cfg.swingSize  := 2.1
         cfg.cooldown   := 4
         cfg.emaLen     := 18
         // Risk Management — breakeven intentionally OFF (BE stops kill TP compounding on MES)
+        // pivotStop enabled Jun 2026: provides structural stop level for broker bracket order.
+        cfg.pivotStop  := true
         cfg.rrGate     := true
         // Compounding
         cfg.resetTp    := true
@@ -471,6 +495,12 @@ int  eodMinute      = input.int(45, "EOD Force-Close Minute (CT)",
     group   = GRP_SES)
 var string TZ = "America/Chicago"
 
+// PRE_MARKET_FLOOR: hard minimum hour (CT) below which entries are always blocked,
+// regardless of sessionStartHr. Protects against thin pre-market liquidity and
+// NinjaTrader session misconfiguration where NT runs with different hours than TV.
+// Cannot be lowered via inputs. 07:00 CT = 08:00 ET (1h before US open).
+int PRE_MARKET_FLOOR = 7
+
 // ── Order Execution ───────────────────────────────────────────────────────────
 bool useMarketOrders = input.bool(true, "Use Market Orders",
     tooltip = "ON = no price field sent, TradersPost submits a market order (recommended). OFF = limit at close +/- pad ticks.",
@@ -648,6 +678,12 @@ float beFloorDist   = beFloorDollars > 0 ? math.ceil(beFloorDollars / tickVal) *
 // input.session() with TZ overrides silently fails on overnight contracts.
 int  barH      = hour(time, TZ)
 int  barM      = minute(time, TZ)
+
+// preMarketBlock: hard floor — no entries before PRE_MARKET_FLOOR (07:00 CT).
+// Fires regardless of sessionStartHr to guard against NinjaTrader running wider
+// session hours than TradingView, which caused pre-market fills in Jun 2026 review.
+bool preMarketBlock = barH < PRE_MARKET_FLOOR
+
 bool inSession = barH >= sessionStartHr and barH < sessionEndHr
 bool afterLock = barH > entryLockHr or (barH == entryLockHr and barM >= entryLockMin)
 
@@ -663,7 +699,8 @@ if sessionJustOpened
     sessionOpenBar := bar_index
 bool bufferOk      = na(sessionOpenBar) or (bar_index - sessionOpenBar >= sessionOpenBuffer)
 
-bool inEntryWindow = inSession and not afterLock and not isEod and bufferOk
+// inEntryWindow: pre-market hard block added — always false before 07:00 CT.
+bool inEntryWindow = inSession and not preMarketBlock and not afterLock and not isEod and bufferOk
 
 // ── Time-of-Day Window Logic ──────────────────────────────────────────────────
 // Uses barH already computed in the Session Windows section above.
@@ -856,17 +893,32 @@ bool goShort = swingHigh and inEntryWindow and cooldownOk and trendOkShort and s
                and windowEnabled and rrOkShort
 
 // ── Entries ───────────────────────────────────────────────────────────────────
+// Stop price helpers: compute the active stop level at entry time so it can be
+// embedded in the alert JSON. TradersPost forwards stopPrice to NinjaTrader,
+// which places a native bracket stop at fill — independent of TV webhook delivery.
+//
+// Long stop:  highest of (pivot − buffer, hard stop).  Pivot wins when nearby.
+// Short stop: lowest  of (pivot + buffer, hard stop).  Pivot wins when nearby.
+//
+// Uses close as entry price proxy (market order). Actual fill may differ by 1–2
+// ticks in fast markets — the hard stop distance absorbs this safely.
+
 if goLong
     entryAtr           := atr
     beTriggered        := false
     pivotStopPrice     := st.downLow
     entryCompoundRatio := effWindowRatio   // capture window ratio at entry time
     strategy.entry("Long", strategy.long, qty = effContracts, comment = "SwingLow")
-    string bTicker = syminfo.ticker
-    string bQty    = str.tostring(effContracts)
-    string buyMsg  = useMarketOrders ?
-         '{"ticker":"' + bTicker + '","action":"buy","sentiment":"bullish","quantity":' + bQty + '}' :
-         '{"ticker":"' + bTicker + '","action":"buy","sentiment":"bullish","price":"' + str.tostring(close + entryPad, format.mintick) + '","quantity":' + bQty + '}'
+    // Compute stop price for native broker bracket order
+    float lHardStop  = close - hardStopDist
+    float lPivStop   = effPivotStop ? st.downLow - effPivotBuf * atr : lHardStop
+    float lStopPrice = math.max(lHardStop, lPivStop)
+    string bTicker   = syminfo.ticker
+    string bQty      = str.tostring(effContracts)
+    string bStop     = str.tostring(lStopPrice, format.mintick)
+    string buyMsg    = useMarketOrders ?
+         '{"ticker":"' + bTicker + '","action":"buy","sentiment":"bullish","quantity":' + bQty + ',"stopPrice":"' + bStop + '"}' :
+         '{"ticker":"' + bTicker + '","action":"buy","sentiment":"bullish","price":"' + str.tostring(close + entryPad, format.mintick) + '","quantity":' + bQty + ',"stopPrice":"' + bStop + '"}'
     alert(buyMsg, alert.freq_once_per_bar)
 
 if goShort
@@ -875,11 +927,16 @@ if goShort
     pivotStopPrice     := st.upHigh
     entryCompoundRatio := effWindowRatio   // capture window ratio at entry time
     strategy.entry("Short", strategy.short, qty = effContracts, comment = "SwingHigh")
-    string sTicker = syminfo.ticker
-    string sQty    = str.tostring(effContracts)
-    string sellMsg = useMarketOrders ?
-         '{"ticker":"' + sTicker + '","action":"sell","sentiment":"bearish","quantity":' + sQty + '}' :
-         '{"ticker":"' + sTicker + '","action":"sell","sentiment":"bearish","price":"' + str.tostring(close - entryPad, format.mintick) + '","quantity":' + sQty + '}'
+    // Compute stop price for native broker bracket order
+    float sHardStop  = close + hardStopDist
+    float sPivStop   = effPivotStop ? st.upHigh + effPivotBuf * atr : sHardStop
+    float sStopPrice = math.min(sHardStop, sPivStop)
+    string sTicker   = syminfo.ticker
+    string sQty      = str.tostring(effContracts)
+    string sStop     = str.tostring(sStopPrice, format.mintick)
+    string sellMsg   = useMarketOrders ?
+         '{"ticker":"' + sTicker + '","action":"sell","sentiment":"bearish","quantity":' + sQty + ',"stopPrice":"' + sStop + '"}' :
+         '{"ticker":"' + sTicker + '","action":"sell","sentiment":"bearish","price":"' + str.tostring(close - entryPad, format.mintick) + '","quantity":' + sQty + ',"stopPrice":"' + sStop + '"}'
     alert(sellMsg, alert.freq_once_per_bar)
 
 // ── Auto Breakeven Check ──────────────────────────────────────────────────────
@@ -993,6 +1050,25 @@ if swingLow and drawLines
         line.new(pivots.high, lp, color = lineColor, width = lineWt)
     pivots.low := lp
 
+// ── Pre-Market Warning Label ─────────────────────────────────────────────────
+// Orange label when the chart's current bar is inside the pre-market hard block.
+// Reminds you that NinjaTrader must also have session hours set to 07:00+ CT
+// so it matches TradingView and doesn't execute alerts from earlier bars.
+var label preMarketLabel = na
+if barstate.islast and preMarketBlock
+    if not na(preMarketLabel)
+        label.delete(preMarketLabel)
+    preMarketLabel := label.new(
+         x         = bar_index,
+         y         = high,
+         text      = "PRE-MARKET BLOCK ACTIVE — entries suppressed before " + str.tostring(PRE_MARKET_FLOOR) + ":00 CT\nVerify NinjaTrader session start = 07:00 CT (08:00 ET)",
+         xloc      = xloc.bar_index,
+         yloc      = yloc.abovebar,
+         style     = label.style_label_down,
+         color     = color.orange,
+         textcolor = color.black,
+         size      = size.normal)
+
 // ── Warning Label — tick size mismatch ───────────────────────────────────────
 // Fires when any dollar input cannot be expressed as at least one full tick.
 // Trading is blocked until the mismatch is resolved.
@@ -1069,11 +1145,21 @@ if barstate.islast and showStatus
 //   5. Set expiry as far out as TradingView allows
 //
 // JSON sent per event (Market Orders ON):
-//   BUY  entry -> action:buy,  sentiment:bullish, quantity:N  (market order)
-//   SELL entry -> action:sell, sentiment:bearish, quantity:N  (market order)
-//   EXIT       -> action:exit  (fires on TP hit, stop, reversal, or EOD)
+//   BUY  entry -> {"action":"buy",  "sentiment":"bullish","quantity":N,"stopPrice":"P"}
+//   SELL entry -> {"action":"sell", "sentiment":"bearish","quantity":N,"stopPrice":"P"}
+//   EXIT       -> {"action":"exit"}   (fires on TP hit, stop, reversal, or EOD)
 //
-// IMPORTANT: TP execution is managed by TradingView's strategy engine.
-// TradersPost receives the entry alert and opens the position in NinjaTrader.
-// The exit alert fires when any close condition is met — ensure webhook
-// delivery is reliable and monitor NinjaTrader fills to confirm each exit.
+// stopPrice is the computed stop level (pivot or hard stop, whichever is tighter).
+// TradersPost forwards this to NinjaTrader, which places a native bracket stop at
+// fill time — the position is protected even if subsequent TV webhooks are delayed.
+//
+// NINJATRADER SESSION HOURS — MUST MATCH TRADINGVIEW:
+//   Set NinjaTrader strategy session start to 07:00 CT (08:00 ET) minimum.
+//   Pre-market fills were observed in Jun 2026 when NT ran wider hours than TV.
+//   The Pine hard floor (PRE_MARKET_FLOOR = 07:00 CT) suppresses TV signals, but
+//   NT must also be configured to ignore any alerts that arrive before 07:00 CT.
+//
+// EXIT ALERT NOTE:
+//   The exit alert remains a flat market close. The native bracket stop placed at
+//   entry handles emergency protection. The TV exit alert fires on TP hit or EOD
+//   and serves as a confirmation close — it is no longer the primary stop mechanism.
