@@ -1,14 +1,14 @@
 //@version=6
 // ─────────────────────────────────────────────────────────────────────────────
-// Market Roadmap Bounce (MRM) — Multi-Symbol Scanner Table
+// Market Roadmap Bounce (MRM) — Multi-Symbol Scanner Table + Chart Overlay
 // Strategy by Jeffry Turnmire (Yellow Brick Road / Elliott Wave)
 // 144/169 EMA cloud + Fibonacci retracements
 //
 // Usage:
-//   1. Paste into TV Pine Editor → Add to chart
+//   1. Paste into TV Pine Editor → Add to chart (overlay)
 //   2. Enter watchlist as comma-separated symbols in Settings (max 20)
 //   3. Table sorts automatically: Stage 4 → 3 → 2 → 1, freshest first
-//   4. Switch the chart to whichever symbol you want to eyeball
+//   4. If the chart symbol is on the watchlist, fib levels are plotted on the chart
 //
 // Stages:
 //   1 TRENDING   — cloud directional, price trending away from cloud
@@ -16,7 +16,7 @@
 //   3 SETUP      — price touching or in cloud (RML event)
 //   4 TRIGGERED  — bounced off cloud, closed above 61.8% fib (call) / below (put)
 // ─────────────────────────────────────────────────────────────────────────────
-indicator("MRM Scanner", shorttitle="MRM", overlay=false)
+indicator("MRM Scanner", shorttitle="MRM", overlay=true, max_lines_count=10, max_labels_count=10)
 
 // ══════════════════════════════════════════════════════════════════════════════
 // INPUTS
@@ -24,18 +24,18 @@ indicator("MRM Scanner", shorttitle="MRM", overlay=false)
 i_syms  = input.string(
               "AAPL,MSFT,NVDA,TSLA,META,AMZN,GOOG,AMD,COIN,MSTR",
               title="Watchlist (comma-separated, max 20 symbols)")
-i_tf    = input.timeframe("1D",  title="Analysis timeframe")
-i_lb    = input.int(60, "Swing lookback (bars)",       minval=20, maxval=250)
-i_fresh = input.int(30, "Max bars since cloud touch",  minval=5,  maxval=100)
+i_tf       = input.timeframe("1D",  title="Analysis timeframe")
+i_lb       = input.int(60, "Swing lookback (bars)",       minval=20, maxval=250)
+i_fresh    = input.int(30, "Max bars since cloud touch",  minval=5,  maxval=100)
+i_show_ref = input.bool(false, "Show strategy reference",
+             tooltip="Displays entry/exit level meanings in the bottom-left corner of the chart")
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SYMBOL PARSING — explicit per-slot strings avoid function closure issues
-// Fallback uses syminfo.ticker (clean ticker, no session JSON)
+// SYMBOL PARSING — var forces simple-array evaluation (fixes security() resolution)
 // ══════════════════════════════════════════════════════════════════════════════
-// var forces evaluation once on bar 0 → simple array → reliable security() resolution
 var _parts = str.split(str.replace_all(i_syms, " ", ""), ",")
 var _n     = math.min(array.size(_parts), 20)
-_fb        = "SPY"  // obvious fallback — if you see SPY in the table a slot failed to resolve
+_fb        = "SPY"  // obvious fallback if a slot can't be resolved
 
 _fs0  = array.size(_parts) > 0  and str.length(array.get(_parts,  0)) > 0 ? array.get(_parts,  0) : _fb
 _fs1  = array.size(_parts) > 1  and str.length(array.get(_parts,  1)) > 0 ? array.get(_parts,  1) : _fb
@@ -59,13 +59,59 @@ _fs18 = array.size(_parts) > 18 and str.length(array.get(_parts, 18)) > 0 ? arra
 _fs19 = array.size(_parts) > 19 and str.length(array.get(_parts, 19)) > 0 ? array.get(_parts, 19) : _fb
 
 // ══════════════════════════════════════════════════════════════════════════════
+// CHART SYMBOL — Cloud + Fib levels (computed from chart bars directly)
+// ══════════════════════════════════════════════════════════════════════════════
+_e144    = ta.ema(close, 144)
+_e169    = ta.ema(close, 169)
+_ct      = math.max(_e144, _e169)
+_cb      = math.min(_e144, _e169)
+_bull    = _e144 > _e169
+_in_cld  = high >= _cb and low <= _ct
+
+_call_touch = _in_cld and _bull
+_put_touch  = _in_cld and not _bull
+_bst_c = nz(ta.barssince(_call_touch), 999)
+_bst_p = nz(ta.barssince(_put_touch),  999)
+
+_sh = ta.highest(high, i_lb)
+_sl = ta.lowest(low,   i_lb)
+
+_rml_c = ta.valuewhen(_call_touch, (_ct + _cb) / 2, 0)
+_rml_p = ta.valuewhen(_put_touch,  (_ct + _cb) / 2, 0)
+
+_rng_c  = _sh - _rml_c
+_f61_c  = _rml_c + 0.618  * _rng_c
+_f114_c = _rml_c + 1.1448 * _rng_c
+_f162_c = _rml_c + 1.618  * _rng_c
+
+_rng_p  = _rml_p - _sl
+_f61_p  = _rml_p - 0.618  * _rng_p
+_f114_p = _rml_p - 1.1448 * _rng_p
+_f162_p = _rml_p - 1.618  * _rng_p
+
+_bst_cur  = _bull ? _bst_c  : _bst_p
+_rml_cur  = _bull ? _rml_c  : _rml_p
+_f61_cur  = _bull ? _f61_c  : _f61_p
+_f114_cur = _bull ? _f114_c : _f114_p
+_f162_cur = _bull ? _f162_c : _f162_p
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CLOUD PLOT — always visible (Yellow Brick Road)
+// ══════════════════════════════════════════════════════════════════════════════
+_ema_col  = _bull ? color.new(#00cc55, 30) : color.new(#ff4455, 30)
+_fill_col = _bull ? color.new(#00cc55, 85) : color.new(#ff4455, 85)
+
+_p144 = plot(_e144, "EMA 144", color=_ema_col, linewidth=1)
+_p169 = plot(_e169, "EMA 169", color=_ema_col, linewidth=1)
+fill(_p144, _p169, color=_fill_col, title="YBR Cloud")
+
+// ══════════════════════════════════════════════════════════════════════════════
 // PRICE FORMATTER
 // ══════════════════════════════════════════════════════════════════════════════
 f_p(v) => na(v) ? "—" : str.tostring(v, "#.00")
 
 // ══════════════════════════════════════════════════════════════════════════════
 // MRM CORE — runs inside request.security() for each symbol
-// Returns: [stage, dir, close, fib61, fib114, fib162, rml, cloud_top, cloud_bot, bst]
 // ══════════════════════════════════════════════════════════════════════════════
 f_mrm() =>
     e144     = ta.ema(close, 144)
@@ -123,7 +169,7 @@ f_mrm() =>
     [stage, dir, close, f61, f114, f162, rml, ct, cb, bst]
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SECURITY FETCHES — one per slot using pre-extracted symbol strings
+// SECURITY FETCHES
 // ══════════════════════════════════════════════════════════════════════════════
 [st0,  dr0,  cl0,  f61_0,  f114_0,  f162_0,  rml0,  ct0,  cb0,  bst0]  = request.security(_fs0,  i_tf, f_mrm())
 [st1,  dr1,  cl1,  f61_1,  f114_1,  f162_1,  rml1,  ct1,  cb1,  bst1]  = request.security(_fs1,  i_tf, f_mrm())
@@ -160,9 +206,76 @@ var a_rml   = array.new_float(20, na)
 var a_bst   = array.new_int(20, 999)
 
 // ══════════════════════════════════════════════════════════════════════════════
+// ALERTS — chart symbol only; configure via TV's Create Alert dialog
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Stage 3: first bar of a new cloud touch (rising edge only, no spam)
+_new_call_touch = _call_touch and not _call_touch[1]
+_new_put_touch  = _put_touch  and not _put_touch[1]
+
+// Stage 4: close crosses 61.8% trigger level within the fresh window
+_trig_call = _bull    and _bst_c <= i_fresh and ta.crossover( close, _f61_c)
+_trig_put  = not _bull and _bst_p <= i_fresh and ta.crossunder(close, _f61_p)
+
+// Targets
+_t1_call = _bull    and _bst_c <= i_fresh and ta.crossover( close, _f114_c)
+_t1_put  = not _bull and _bst_p <= i_fresh and ta.crossunder(close, _f114_p)
+_t3_call = _bull    and _bst_c <= i_fresh and ta.crossover( close, _f162_c)
+_t3_put  = not _bull and _bst_p <= i_fresh and ta.crossunder(close, _f162_p)
+
+alertcondition(_new_call_touch or _new_put_touch,
+     title   = "MRM Setup — Cloud Touch (Stage 3)",
+     message = "{{ticker}} MRM SETUP: Price touched YBR cloud (RML) — {{interval}} chart  close: {{close}}")
+
+alertcondition(_trig_call or _trig_put,
+     title   = "MRM Triggered — 61.8% Cross (Stage 4)",
+     message = "{{ticker}} MRM TRIGGERED: 61.8% crossed — {{interval}} chart  close: {{close}}")
+
+alertcondition(_t1_call or _t1_put,
+     title   = "MRM Target 1 — 114.48%",
+     message = "{{ticker}} MRM T1 HIT: 114.48% target — {{interval}} chart  close: {{close}}")
+
+alertcondition(_t3_call or _t3_put,
+     title   = "MRM Target 3 — 161.8%",
+     message = "{{ticker}} MRM T3 HIT: 161.8% target — {{interval}} chart  close: {{close}}")
+
+// Visual markers for alert events
+plotshape(_new_call_touch, title="Call Touch (RML)", style=shape.triangleup,   location=location.belowbar, color=color.new(#00cc55, 0), size=size.tiny,  text="RML")
+plotshape(_new_put_touch,  title="Put Touch (RML)",  style=shape.triangledown, location=location.abovebar, color=color.new(#ff4455, 0), size=size.tiny,  text="RML")
+plotshape(_trig_call or _trig_put, title="61.8% Trigger",  style=shape.diamond,  location=location.belowbar, color=color.new(#ffdd66, 0), size=size.small, text="61.8%")
+plotshape(_t1_call or _t1_put,     title="T1 114.48%",     style=shape.diamond,  location=location.belowbar, color=color.new(#88aaff, 0), size=size.small, text="T1")
+plotshape(_t3_call or _t3_put,     title="T3 161.8%",      style=shape.diamond,  location=location.belowbar, color=color.new(#ff88aa, 0), size=size.small, text="T3")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FIB LEVEL LINES + LABELS (persistent, recreated each last-bar update)
+// ══════════════════════════════════════════════════════════════════════════════
+var line  _l_rml  = na
+var line  _l_f61  = na
+var line  _l_f114 = na
+var line  _l_f162 = na
+var label _lb_rml  = na
+var label _lb_f61  = na
+var label _lb_f114 = na
+var label _lb_f162 = na
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TABLE HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+f_ref_row(t, row, level, desc, lc, dc, bg, sz) =>
+    table.cell(t, 0, row, level, text_color=lc, bgcolor=bg, text_size=sz, text_halign=text.align_right)
+    table.cell(t, 1, row, desc,  text_color=dc, bgcolor=bg, text_size=sz, text_halign=text.align_left)
+
+// ══════════════════════════════════════════════════════════════════════════════
 // TABLE
 // ══════════════════════════════════════════════════════════════════════════════
-var tbl = table.new(position.middle_right, 9, 22,
+var ref_tbl = table.new(position.bottom_right, 2, 9,
+              bgcolor      = color.new(#0d1117, 5),
+              border_color = #2a2a3e,
+              border_width = 1,
+              frame_color  = #2a2a3e,
+              frame_width  = 1)
+
+var tbl = table.new(position.top_right, 9, 22,
           bgcolor      = color.new(#0d1117, 5),
           border_color = #2a2a3e,
           border_width = 1,
@@ -171,7 +284,7 @@ var tbl = table.new(position.middle_right, 9, 22,
 
 if barstate.islast
 
-    // ── Symbol display names from pre-extracted strings ────────────────────
+    // ── Populate symbol display names ──────────────────────────────────────
     array.set(a_sym,  0, _fs0)
     array.set(a_sym,  1, _fs1)
     array.set(a_sym,  2, _fs2)
@@ -373,6 +486,56 @@ if barstate.islast
     array.set(a_f162,  19, f162_19)
     array.set(a_rml,   19, rml19)
     array.set(a_bst,   19, bst19)
+
+    // ── Fib lines for chart symbol (if on watchlist + recent touch) ────────
+    _chart = syminfo.ticker
+    _on_list = false
+    for i = 0 to _n - 1
+        if array.get(_parts, i) == _chart
+            _on_list := true
+            break
+
+    // Delete previous lines/labels
+    line.delete(_l_rml)
+    line.delete(_l_f61)
+    line.delete(_l_f114)
+    line.delete(_l_f162)
+    label.delete(_lb_rml)
+    label.delete(_lb_f61)
+    label.delete(_lb_f114)
+    label.delete(_lb_f162)
+
+    if _on_list and _bst_cur <= i_fresh
+        _x1 = bar_index - math.min(_bst_cur + 5, 80)  // start near the touch bar
+        _lx = bar_index + 3                             // label anchor (just right of last bar)
+
+        _l_rml  := line.new(_x1, _rml_cur,  bar_index, _rml_cur,  xloc=xloc.bar_index, color=color.new(color.gray, 20),  width=1, style=line.style_dashed, extend=extend.right)
+        _l_f61  := line.new(_x1, _f61_cur,  bar_index, _f61_cur,  xloc=xloc.bar_index, color=color.new(#ffdd66,  0),     width=2, extend=extend.right)
+        _l_f114 := line.new(_x1, _f114_cur, bar_index, _f114_cur, xloc=xloc.bar_index, color=color.new(#88aaff,  0),     width=1, style=line.style_dotted, extend=extend.right)
+        _l_f162 := line.new(_x1, _f162_cur, bar_index, _f162_cur, xloc=xloc.bar_index, color=color.new(#ff88aa,  0),     width=1, style=line.style_dotted, extend=extend.right)
+
+        _lb_rml  := label.new(_lx, _rml_cur,  "RML 0%    " + f_p(_rml_cur),  xloc=xloc.bar_index, color=color.new(color.black, 100), textcolor=color.new(color.gray, 10), style=label.style_label_left, size=size.small)
+        _lb_f61  := label.new(_lx, _f61_cur,  "61.8%     " + f_p(_f61_cur),  xloc=xloc.bar_index, color=color.new(color.black, 100), textcolor=#ffdd66,                   style=label.style_label_left, size=size.small)
+        _lb_f114 := label.new(_lx, _f114_cur, "114.48%  " + f_p(_f114_cur),  xloc=xloc.bar_index, color=color.new(color.black, 100), textcolor=#88aaff,                   style=label.style_label_left, size=size.small)
+        _lb_f162 := label.new(_lx, _f162_cur, "161.8%    " + f_p(_f162_cur), xloc=xloc.bar_index, color=color.new(color.black, 100), textcolor=#ff88aa,                   style=label.style_label_left, size=size.small)
+
+    // ── Strategy reference table (toggle with i_show_ref) ─────────────────
+    if i_show_ref
+        C_REF_HDR = #1a1a2e
+        C_REF_BG  = color.new(#0d1117, 5)
+        SZ_R      = size.small
+
+        table.cell(ref_tbl, 0, 0, "Level",   text_color=color.new(color.silver, 20), bgcolor=C_REF_HDR, text_size=SZ_R, text_halign=text.align_right)
+        table.cell(ref_tbl, 1, 0, "Meaning", text_color=color.new(color.silver, 20), bgcolor=C_REF_HDR, text_size=SZ_R, text_halign=text.align_left)
+
+        f_ref_row(ref_tbl, 1, "RML touch",  "Watch — price entered cloud",          color.gray,  color.gray,                      C_REF_BG, SZ_R)
+        f_ref_row(ref_tbl, 2, "61.8%  ▶",   "ENTRY — bounce confirmed (Stage 4)",   #ffdd66,     color.white,                     C_REF_BG, SZ_R)
+        f_ref_row(ref_tbl, 3, "114.48%  ▶", "T1 — partial exit (~50%)",             #88aaff,     color.white,                     C_REF_BG, SZ_R)
+        f_ref_row(ref_tbl, 4, "127.2%  ▶",  "T2 — secondary partial (optional)",    #aabbff,     color.new(color.white, 30),      C_REF_BG, SZ_R)
+        f_ref_row(ref_tbl, 5, "161.8%  ▶",  "T3 — full exit / trail stop",          #ff88aa,     color.white,                     C_REF_BG, SZ_R)
+        f_ref_row(ref_tbl, 6, "Stop",       "$1 below RML — setup invalidated",      color.red,   color.new(color.white, 20),      C_REF_BG, SZ_R)
+        f_ref_row(ref_tbl, 7, "CALL",       "Bullish cloud · bounce expected up",    #00cc55,     color.new(color.white, 20),      C_REF_BG, SZ_R)
+        f_ref_row(ref_tbl, 8, "PUT",        "Bearish cloud · rejection expected dn", #ff4455,     color.new(color.white, 20),      C_REF_BG, SZ_R)
 
     // ── Sort: stage desc, then freshness (low BST) first ──────────────────
     a_key = array.new_int(20, 0)
