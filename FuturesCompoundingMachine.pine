@@ -46,6 +46,30 @@
 //    order sequencing. The TP limit self-corrects the following bar.
 //
 //  CHANGELOG:
+//    v4 — Jun 2026 (cash-open blackout):
+//      1. New "Block Entries Around Cash Open" gate (GRP_SES). Blocks NEW entries
+//         inside a configurable window (default 08:25–08:35 CT, inclusive) around
+//         the 08:30 CT / 09:30 ET equity-index cash open. Rationale: a swing entry
+//         taken into the open bar can have its hard stop gapped straight through —
+//         a tight MYM stop ($10/20 pts under Auto-Config) filled ~$77 on a single
+//         150-pt open bar, blowing past Max Loss Per Trade. Blocking entry in the
+//         window avoids initiating into that gap; open positions/stops unaffected.
+//         Status label shows [OPEN BLACKOUT] while active.
+//    v3 — Jun 2026 (RSI confirmation gate):
+//      1. Entry second-confirmation: a Gann swing signal alone no longer fires an
+//         entry — RSI must also be *sharply* trending in the trade direction.
+//         "Sharp" = RSI slope (rsi − rsi[slopeLen]) beyond a threshold; longs need
+//         sharp-up, shorts sharp-down. Optional midline gate also requires RSI on
+//         the bullish/bearish side of 50. Toggle: "Require RSI Entry Confirmation".
+//      2. Exit on RSI reversal (OR with TP / stop / EOD): while in a position, if
+//         the RSI slope flips against the trade beyond the exit threshold the
+//         position is closed at market ("RSI Reversal"). Routes through the normal
+//         trade-close path → compounding update + {"action":"exit"} alert fire as
+//         usual. Toggle: "Exit on RSI Reversal".
+//      3. RSI inputs live in their own "RSI Confirmation" group as global filters
+//         (not yet per-instrument auto-configured — calibrate, then promote into
+//         InstrumentConfig later, same as the MGC/MBT placeholder pattern). RSI
+//         value + slope are shown in the status label (no chart plot — overlay pane).
 //    v2 — Jun 2026 (live validation review):
 //      1. calc_on_every_tick remains false: tick-by-tick eval was tested but caused
 //         immediate exits on MYM — $10 hard stop (20 pts) fires on normal intrabar
@@ -252,6 +276,7 @@ var string GRP_BIAS = "Day Bias (Direction Override)"
 var string GRP_SIZE = "Position Sizing"
 var string GRP_RISK = "Risk Management"
 var string GRP_FILT = "Signal Filters"
+var string GRP_RSI  = "RSI Confirmation (Entry + Exit)"
 var string GRP_SES  = "Session & Hours (CME Futures)"
 var string GRP_EXEC = "Order Execution (TradersPost)"
 var string GRP_VIS  = "Visuals"
@@ -455,6 +480,42 @@ int   cooldownBars   = input.int(4,      "Cooldown (bars)",
     tooltip = "[Overridden when Auto-Config is ON]",
     group   = GRP_FILT)
 
+// ── RSI Confirmation ──────────────────────────────────────────────────────────
+// Second confirmation on top of the Gann swing signal. A swing alone is no longer
+// enough — RSI momentum must agree with the trade direction at entry, and an
+// optional RSI reversal closes the position early (OR with the TP / stop / EOD).
+// These are GLOBAL filters (not per-instrument auto-config). Calibrate per symbol
+// with Auto-Config OFF first, then promote into InstrumentConfig if desired.
+bool  useRsiEntry  = input.bool(true,  "Require RSI Entry Confirmation",
+    tooltip = "ON: a long needs RSI sharply UP-trending, a short needs RSI sharply DOWN-trending, in addition to the swing signal. OFF: RSI is ignored at entry.",
+    group   = GRP_RSI)
+int   rsiLen       = input.int(14,     "RSI Length",
+    minval  = 2,
+    tooltip = "Lookback for the RSI itself. 14 = standard.",
+    group   = GRP_RSI)
+int   rsiSlopeLen  = input.int(3,      "RSI Slope Lookback (bars)",
+    minval  = 1,
+    tooltip = "'Sharp' is measured as the RSI change over this many bars: slope = rsi − rsi[N]. Smaller = more reactive / sharper requirement window.",
+    group   = GRP_RSI)
+float rsiEntrySlope = input.float(3.0, "Min Entry Slope (RSI pts over lookback)",
+    minval  = 0.0, step = 0.5,
+    tooltip = "Minimum RSI rise (long) or fall (short) over the slope lookback to confirm an entry. Higher = only steeper momentum qualifies. Example: 3.0 over 3 bars.",
+    group   = GRP_RSI)
+bool  useRsiMid    = input.bool(true,  "Also Require RSI Above/Below Midline",
+    tooltip = "ON: longs additionally require RSI above the midline, shorts below it — RSI must be sharply trending AND on the correct side of 50.",
+    group   = GRP_RSI)
+float rsiMidLevel  = input.float(50.0, "  RSI Midline",
+    minval  = 1.0, maxval = 99.0, step = 1.0,
+    tooltip = "Midline for the optional side gate. 50 = neutral RSI. Raise/lower to demand stronger momentum before entry.",
+    group   = GRP_RSI)
+bool  useRsiExit   = input.bool(true,  "Exit on RSI Reversal",
+    tooltip = "ON: while in a trade, if RSI slope flips against the position beyond the exit threshold below, close at market ('RSI Reversal'). This is an OR with the TP, stop, and EOD exits — whichever triggers first wins.",
+    group   = GRP_RSI)
+float rsiExitSlope = input.float(3.0, "  Min Reversal Slope (RSI pts over lookback)",
+    minval  = 0.5, step = 0.5,
+    tooltip = "How sharply RSI must move AGAINST the position (over the slope lookback) to trigger an early exit. For a long: RSI falling this many points. For a short: RSI rising this many points.",
+    group   = GRP_RSI)
+
 // ── Session ───────────────────────────────────────────────────────────────────
 // NOTE: input.session() with a TZ override silently fails on 24h continuous
 // futures contracts in TradingView — session strings are not reliable for
@@ -484,6 +545,25 @@ int  entryLockHr    = input.int(15, "Lock New Entries After Hour (CT)",
 int  entryLockMin   = input.int(30, "Lock New Entries After Minute",
     minval  = 0, maxval = 59,
     tooltip = "Combined with Lock Hour — no new entries after HH:MM CT. Default 15:30 CT.",
+    group   = GRP_SES)
+// ── Cash-Open Blackout ────────────────────────────────────────────────────────
+// Blocks NEW entries around the 08:30 CT (09:30 ET) equity-index cash open, the
+// most gap-prone minutes of the day. A swing entry taken into that bar can have
+// its hard stop gapped straight through (e.g. a $10/20-pt MYM stop filling ~$77
+// when the open bar travels 150 pts). Blocking entry in the window avoids
+// initiating into that gap. Exits/stops on already-open positions are unaffected.
+bool useOpenBlackout = input.bool(true, "Block Entries Around Cash Open",
+    tooltip = "ON: no new entries inside the blackout window below (defaults to the 08:30 CT cash open ±5 min). Existing positions and their stops are unaffected. Targets the gap-through that makes a single open-bar loss exceed Max Loss Per Trade.",
+    group   = GRP_SES)
+int  openBlackoutStartHr  = input.int(8,  "  Blackout Start Hour (CT)",
+    minval = 0, maxval = 23, group = GRP_SES)
+int  openBlackoutStartMin = input.int(25, "  Blackout Start Minute",
+    minval = 0, maxval = 59, group = GRP_SES)
+int  openBlackoutEndHr    = input.int(8,  "  Blackout End Hour (CT)",
+    minval = 0, maxval = 23, group = GRP_SES)
+int  openBlackoutEndMin   = input.int(35, "  Blackout End Minute",
+    minval = 0, maxval = 59,
+    tooltip = "Blackout is inclusive of start and end minute. Default 08:25–08:35 CT covers the 08:30 cash-open spike. Widen (e.g. to 08:40) if gaps persist into the first 10 minutes.",
     group   = GRP_SES)
 int  eodCloseHr     = input.int(15, "EOD Force-Close Hour (CT)",
     minval  = 0, maxval = 23,
@@ -687,6 +767,12 @@ bool preMarketBlock = barH < PRE_MARKET_FLOOR
 bool inSession = barH >= sessionStartHr and barH < sessionEndHr
 bool afterLock = barH > entryLockHr or (barH == entryLockHr and barM >= entryLockMin)
 
+// inOpenBlackout: minute-of-day inside the cash-open blackout window (inclusive).
+int  barTod        = barH * 60 + barM
+int  obStart       = openBlackoutStartHr * 60 + openBlackoutStartMin
+int  obEnd         = openBlackoutEndHr   * 60 + openBlackoutEndMin
+bool inOpenBlackout = useOpenBlackout and barTod >= obStart and barTod <= obEnd
+
 // isEod: explicit hour:minute pair — independent of sessionEndHr so it can be
 // placed before the CME maintenance halt regardless of sessionEndHr setting.
 bool isEod     = barH > eodCloseHr or (barH == eodCloseHr and barM >= eodMinute)
@@ -700,7 +786,8 @@ if sessionJustOpened
 bool bufferOk      = na(sessionOpenBar) or (bar_index - sessionOpenBar >= sessionOpenBuffer)
 
 // inEntryWindow: pre-market hard block added — always false before 07:00 CT.
-bool inEntryWindow = inSession and not preMarketBlock and not afterLock and not isEod and bufferOk
+// Cash-open blackout also blocks new entries around the 08:30 CT open.
+bool inEntryWindow = inSession and not preMarketBlock and not afterLock and not isEod and bufferOk and not inOpenBlackout
 
 // ── Time-of-Day Window Logic ──────────────────────────────────────────────────
 // Uses barH already computed in the Session Windows section above.
@@ -739,6 +826,12 @@ bool  trendDn  = close < trendEma
 plot(drawEma and useTrendFilter ? trendEma : na,
      title = "Trend EMA", color = emaColor, linewidth = 2)
 
+// ── RSI Momentum ──────────────────────────────────────────────────────────────
+// rsiSlope: RSI change over rsiSlopeLen bars — the "sharpness" measure used by
+// both the entry confirmation and the reversal exit. Positive = RSI rising.
+float rsiVal   = ta.rsi(close, rsiLen)
+float rsiSlope = rsiVal - rsiVal[rsiSlopeLen]
+
 // ── Bar Classification ────────────────────────────────────────────────────────
 bool isUp         = high > high[1] and low > low[1]
 bool isDown       = high < high[1] and low < low[1]
@@ -772,6 +865,25 @@ bool  sizeOkLong  = not useSwingSize or (not na(swingLeg) and swingLeg >= effSwi
 bool  sizeOkShort = sizeOkLong
 
 bool cooldownOk = not useCooldown or na(lastExit) or (bar_index - lastExit >= effCooldown)
+
+// ── RSI Confirmation Gates ────────────────────────────────────────────────────
+// Entry: RSI must be sharply trending in the trade direction (slope past threshold)
+// and, optionally, on the bullish/bearish side of the midline.
+//   rsiOkLong  — RSI rising hard (and >= midline when the side gate is on)
+//   rsiOkShort — RSI falling hard (and <= midline when the side gate is on)
+// na(rsiSlope) guard: true (pass) until enough bars exist for the slope lookback.
+bool rsiUpSharp   = not na(rsiSlope) and rsiSlope >=  rsiEntrySlope
+bool rsiDnSharp   = not na(rsiSlope) and rsiSlope <= -rsiEntrySlope
+bool rsiMidOkLong  = not useRsiMid or rsiVal >= rsiMidLevel
+bool rsiMidOkShort = not useRsiMid or rsiVal <= rsiMidLevel
+bool rsiOkLong    = not useRsiEntry or (na(rsiSlope) ? false : (rsiUpSharp and rsiMidOkLong))
+bool rsiOkShort   = not useRsiEntry or (na(rsiSlope) ? false : (rsiDnSharp and rsiMidOkShort))
+
+// Reversal exit: RSI slope flips against the open position beyond the exit threshold.
+//   rsiRevDown — sharp down move → exit a LONG
+//   rsiRevUp   — sharp up move   → exit a SHORT
+bool rsiRevDown = not na(rsiSlope) and rsiSlope <= -rsiExitSlope
+bool rsiRevUp   = not na(rsiSlope) and rsiSlope >=  rsiExitSlope
 
 // ── Apex Adaptive Trend (Embedded) ────────────────────────────────────────────
 // Adapted from "Apex Adaptive Trend Navigator [Pineify]" (MPL 2.0 © Pineify).
@@ -883,12 +995,12 @@ int   sizeExtra      = effAutoSize ? math.max(0, math.min(effSizeMax,
 int   effContracts   = contracts + sizeExtra
 
 bool goLong  = swingLow  and inEntryWindow and cooldownOk and trendOkLong  and sizeOkLong
-               and biasAllowLong
+               and biasAllowLong and rsiOkLong
                and not dailyHalted and not consecDayHalted and not showWarning and not tpBelowFloor
                and windowEnabled and rrOkLong
 
 bool goShort = swingHigh and inEntryWindow and cooldownOk and trendOkShort and sizeOkShort
-               and biasAllowShort
+               and biasAllowShort and rsiOkShort
                and not dailyHalted and not consecDayHalted and not showWarning and not tpBelowFloor
                and windowEnabled and rrOkShort
 
@@ -997,6 +1109,17 @@ if strategy.position_size < 0 and not na(entryAtr)
         comment_profit = "TP Hit",
         comment_loss   = sLossLbl)
 
+// ── RSI Reversal Exit (OR with TP / stop / EOD) ───────────────────────────────
+// Closes the position at market when RSI momentum flips against it beyond the
+// reversal threshold. strategy.close() emits a market order; the resulting trade
+// close is picked up by the trade-close detection block below (compounding update
+// + {"action":"exit"} alert), exactly like a TP/stop/EOD exit. The entry required
+// RSI sharply WITH the trade, so a reversal cannot fire on the entry bar itself.
+if useRsiExit and strategy.position_size > 0 and rsiRevDown
+    strategy.close("Long",  comment = "RSI Reversal")
+if useRsiExit and strategy.position_size < 0 and rsiRevUp
+    strategy.close("Short", comment = "RSI Reversal")
+
 // ── EOD Force-Close ───────────────────────────────────────────────────────────
 if isEod and strategy.position_size != 0
     strategy.close_all(comment = "EOD Close")
@@ -1098,7 +1221,7 @@ var label statusLabel = na
 if barstate.islast and showStatus
     if not na(statusLabel)
         label.delete(statusLabel)
-    string haltStr  = consecDayHalted ? " [DAY STREAK HALT " + str.tostring(consecLossDays) + "d]" : dailyHalted ? " [HALTED]" : tpBelowFloor ? " [TP FLOOR]" : (not windowEnabled ? " [WINDOW OFF]" : "")
+    string haltStr  = consecDayHalted ? " [DAY STREAK HALT " + str.tostring(consecLossDays) + "d]" : dailyHalted ? " [HALTED]" : tpBelowFloor ? " [TP FLOOR]" : inOpenBlackout ? " [OPEN BLACKOUT]" : (not windowEnabled ? " [WINDOW OFF]" : "")
     string winStr   = windowEnabled ? winName + "  x" + str.tostring(effWindowRatio, "#.##") : winName + " (disabled)"
     string rrLStr   = "Long  R:R: " + str.tostring(longRR,  "#.##") + (rrOkLong  ? "" : " [below min]")
     string rrSStr   = "Short R:R: " + str.tostring(shortRR, "#.##") + (rrOkShort ? "" : " [below min]")
@@ -1109,6 +1232,16 @@ if barstate.islast and showStatus
     string ln5      = "Consec Losses: " + str.tostring(consecLosses) + " / " + str.tostring(effMaxConsec) + "   Loss Days: " + str.tostring(consecLossDays) + " / " + str.tostring(maxConsecDays) + (consecDayHalted ? " ◄ HALTED" : "")
     string ln6      = "Window       : " + winStr
     string ln7      = rrLStr + "   " + rrSStr
+    string rsiState = na(rsiSlope) ? "warming up" :
+                      rsiUpSharp ? "sharp ↑" : rsiDnSharp ? "sharp ↓" : "flat"
+    string rsiGate  = not useRsiEntry ? "OFF" :
+                      (rsiOkLong and rsiOkShort) ? "both ok" :
+                      rsiOkLong ? "long ok" : rsiOkShort ? "short ok" : "blocked"
+    string rsiExitS = useRsiExit ? ("  exit@±" + str.tostring(rsiExitSlope, "#.#")) : "  exit OFF"
+    string rsiSlopeStr = na(rsiSlope) ? "na" : (rsiSlope >= 0 ? "+" : "") + str.tostring(rsiSlope, "#.#")
+    string ln7b     = "RSI(" + str.tostring(rsiLen) + ") : " + str.tostring(rsiVal, "#.#") +
+                      "  slope " + rsiSlopeStr + "/" + str.tostring(rsiSlopeLen) + "b (" + rsiState + ")" +
+                      "  entry[" + rsiGate + "]" + rsiExitS
     string sizingStr = effAutoSize ?
          "ON  contracts=" + str.tostring(effContracts) + " (base " + str.tostring(contracts) + " +" + str.tostring(sizeExtra) + " extra)" +
          "  cumPnl=$" + str.tostring(sizingCumPnl, "#.##") +
@@ -1128,7 +1261,7 @@ if barstate.islast and showStatus
     statusLabel := label.new(
          x         = bar_index,
          y         = high,
-         text      = ln1 + "\n" + ln2 + "\n" + ln3 + "\n" + ln4 + "\n" + ln5 + "\n" + ln6 + "\n" + ln7 + "\n" + ln8 + "\n" + ln9,
+         text      = ln1 + "\n" + ln2 + "\n" + ln3 + "\n" + ln4 + "\n" + ln5 + "\n" + ln6 + "\n" + ln7 + "\n" + ln7b + "\n" + ln8 + "\n" + ln9,
          xloc      = xloc.bar_index,
          yloc      = yloc.abovebar,
          style     = label.style_label_left,
