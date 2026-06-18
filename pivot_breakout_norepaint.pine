@@ -156,11 +156,18 @@ exitReason = tpHit and barstate.isconfirmed ? "tp"    :
 if exitReason != ""
     strategy.close("Long")
 
-    // Market order: by the time TV fires the alert and TradersPost acts on it,
-    // the price may have moved past any limit we specify. A limit at tpPrice
-    // is unfillable if the bar reversed after touching TP; a limit at close
-    // is unfillable if the stop bar gapped further. Market exits immediately.
-    exitJson =
+    // TP exits: limit at tpPrice — captures the intended level precisely and,
+    // on live brokers, cancels the resting OCO set by the entry JSON before
+    // placing this order. Only use limit when close >= tpPrice (bar actually
+    // closed at/above TP); if bar only wicked to TP and reversed, fall back
+    // to market so we don't leave a dangling resting sell Pine can't cancel.
+    // Trail/EOD: always market — stop bars can gap; a limit at close risks
+    // non-fill on a fast move.
+    exitJson = exitReason == "tp" and close >= tpPrice ?
+         '{"ticker": "' + syminfo.ticker + '",' +
+         '"action": "exit",' +
+         '"orderType": "limit",' +
+         '"limitPrice": ' + str.tostring(math.ceil(tpPrice * 100) / 100) + '}' :
          '{"ticker": "' + syminfo.ticker + '",' +
          '"action": "exit",' +
          '"orderType": "market"}'
