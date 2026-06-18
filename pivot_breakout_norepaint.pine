@@ -109,10 +109,16 @@ tpHit = inTrade and not na(tpPrice) and high >= tpPrice
 
 // ─────────────────────────────────────────────
 // TRAILING STOP
+// On the first bar of a new trade, seed highestPrice from the entry price
+// (not just that bar's high). Without this, a gap-down on bar N+1 sets
+// highestPrice below entry, allowing the trail stop to start far below the
+// entry price — the position can stay open well past the intended stop %.
 // ─────────────────────────────────────────────
 var float highestPrice = na
-if inTrade
-    highestPrice := na(highestPrice) ? high : math.max(highestPrice, high)
+if strategy.position_size > 0 and strategy.position_size[1] == 0
+    highestPrice := math.max(strategy.position_avg_price, high)
+else if inTrade
+    highestPrice := math.max(highestPrice, high)
 else
     highestPrice := na
 
@@ -137,7 +143,10 @@ plot(inTrade and not na(tpPrice) ? tpPrice : na, "Take Profit",   color=color.gr
 f_isEODExit() =>
     time >= timestamp(syminfo.timezone, year, month, dayofmonth, eodHour, eodMinute)
 
-exitCondition = barstate.isconfirmed and inTrade and close <= trailStop
+// Use low (not close) so intrabar stop breaches fire at bar close.
+// On low-priced volatile stocks the close can recover above the stop
+// even after the low pierced it — using close alone leaves you stuck.
+exitCondition = barstate.isconfirmed and inTrade and low <= trailStop
 eodExit       = barstate.isconfirmed and closeEOD and inTrade and f_isEODExit()
 
 exitReason = tpHit and barstate.isconfirmed ? "tp"    :
@@ -146,16 +155,16 @@ exitReason = tpHit and barstate.isconfirmed ? "tp"    :
 
 if exitReason != ""
     strategy.close("Long")
-    float exitLimitPrice = exitReason == "tp"
-         ? math.ceil( tpPrice * 100.0) / 100.0
-         : math.floor(close   * 100.0) / 100.0
 
+    // Market order: by the time TV fires the alert and TradersPost acts on it,
+    // the price may have moved past any limit we specify. A limit at tpPrice
+    // is unfillable if the bar reversed after touching TP; a limit at close
+    // is unfillable if the stop bar gapped further. Market exits immediately.
     exitJson =
          '{"ticker": "' + syminfo.ticker + '",' +
          '"action": "exit",' +
-         '"orderType": "limit",' +
-         '"limitPrice": ' + str.tostring(exitLimitPrice) + '}'
+         '"orderType": "market"}'
 
     alert(exitJson, alert.freq_once_per_bar_close)
     if debugEnabled
-        log.info("Exit reason=" + exitReason + " " + exitJson)
+        log.info("Exit reason=" + exitReason + " px=" + str.tostring(close) + " " + exitJson)
