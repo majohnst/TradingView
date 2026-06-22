@@ -1,0 +1,208 @@
+//@version=6
+strategy(
+     'BottleRocket Pivot Breakout',
+     overlay=true,
+     initial_capital=1000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=200,
+     process_orders_on_close=true,
+     pyramiding=0,
+     calc_on_every_tick=true
+)
+
+// ─────────────────────────────────────────────
+// Inputs
+// ─────────────────────────────────────────────
+trailPct    = input.float(4.0,  "Trailing Stop %", step=0.1) / 100
+approachPct = input.float(10.0, "Max Approach Distance % (below pivot)", step=0.5,
+     tooltip="Prior-day close must be within this % below the pivot. Filters stocks gapping from far away rather than breaking from a tight setup.")
+use5DMA     = input.bool(false, "Require Price Above 5-Day MA",
+     tooltip="Trend filter: only take pivot breaks when price is above the 5-day MA.")
+
+atrMaxPct   = input.float(8.0,  "Max ATR % of Price (volatility gate)", step=0.5,
+     tooltip="Only enter when the stock's prior-day ATR is ≤ this % of price. " +
+             "Ensures a fixed % trailing stop is meaningful vs normal noise. " +
+             "BottleRocket stocks (>$10) typically run 3–8%. " +
+             "Skip any stock where ATR% exceeds this threshold.")
+minPrice    = input.float(10.0, "Min Price — BottleRocket gate ($)", step=1.0,
+     tooltip="BottleRocket universe: only trade stocks at or above this price.")
+
+tpQuantity  = input.float(1000, "Dollar Amount",      group="TradersPost")
+tpTp        = input.float(10.0, "Take Profit %",      step=1.0, minval=2.5, group="TradersPost")
+tpSl        = input.float(4.0,  "Stop Loss %",        step=1.0, minval=2.5, group="TradersPost")
+tpSetTargets = input.bool(true, "Send TP/SL in JSON", group="TradersPost")
+
+closeEOD    = input.bool(true, "Force Close at EOD")
+eodHour     = input.int(15,    "EOD Hour (Exchange Time)")
+eodMinute   = input.int(58,    "EOD Minute")
+debugEnabled = input.bool(false, "Debug logging")
+
+// ─────────────────────────────────────────────
+// PRIOR-DAY PIVOT
+// Fixed from yesterday's RTH H/L/C — never the developing intraday pivot.
+// Standard floor trader's pivot: (H + L + C) / 3
+// ─────────────────────────────────────────────
+[pH, pL, pC] = request.security(
+     syminfo.tickerid, "D",
+     [high[1], low[1], close[1]],
+     barmerge.gaps_off,
+     barmerge.lookahead_off
+)
+
+pivotLevel = (pH + pL + pC) / 3
+r1         = 2 * pivotLevel - pL
+s1         = 2 * pivotLevel - pH
+r2         = pivotLevel + (pH - pL)
+s2         = pivotLevel - (pH - pL)
+
+// ─────────────────────────────────────────────
+// PRIOR-DAY ATR (14-period, daily resolution)
+// [1] gives the prior completed day's ATR — fixed before today's session.
+// Used as % of prior-day close so the threshold is stable within the session.
+// ─────────────────────────────────────────────
+dailyAtr14 = request.security(syminfo.tickerid, "D", ta.atr(14)[1],
+     barmerge.gaps_off, barmerge.lookahead_off)
+// Compare to prior-day close (fixed reference, not the current tick)
+atrPct = na(dailyAtr14) or pC <= 0 ? na : dailyAtr14 / pC * 100
+
+// ─────────────────────────────────────────────
+// TRUE 5-DAY MA
+// ─────────────────────────────────────────────
+get5DMA() =>
+    barsPerDay = 390.0 / (timeframe.in_seconds() / 60.0)
+    ta.sma(close, math.round(barsPerDay * 5))
+
+ma5d = use5DMA ? get5DMA() : na
+
+// ─────────────────────────────────────────────
+// ENTRY QUALIFIERS
+// Entry stays bar-close confirmed (confirmed crossovers only, no repaint).
+// ATR gate and price gate checked here as additional filters.
+// ─────────────────────────────────────────────
+prevDayClose = request.security(syminfo.tickerid, "D", close[1],
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+withinApproach = prevDayClose >= pivotLevel * (1 - approachPct / 100)
+trendOk        = not use5DMA or close[1] > ma5d[1]
+priceOk        = close >= minPrice
+atrOk          = na(atrPct) or atrPct <= atrMaxPct
+crossUp        = ta.crossover(close, pivotLevel)
+inTrade        = strategy.position_size > 0
+
+if barstate.isconfirmed and crossUp and not inTrade and withinApproach and trendOk and priceOk and atrOk
+    strategy.entry("Long", strategy.long)
+    float enterLimitPrice = math.ceil(close * 100.0) / 100.0
+
+    entryJson = tpSetTargets ?
+         '{\n"ticker": "' + syminfo.ticker + '",' +
+         '\n"action": "buy",' +
+         '\n"quantityType": "dollar_amount",' +
+         '\n"quantity": '   + str.tostring(tpQuantity) + ',' +
+         '\n"no_add": true,' +
+         '\n"takeProfit": {"percent": ' + str.tostring(tpTp) + '},' +
+         '\n"stopLoss": {"type": "stop","percent": ' + str.tostring(tpSl) + '},' +
+         '\n"orderType": "limit",' +
+         '\n"limitPrice": ' + str.tostring(enterLimitPrice) + '\n}' :
+         '{\n"ticker": "' + syminfo.ticker + '",' +
+         '\n"action": "buy",' +
+         '\n"quantityType": "dollar_amount",' +
+         '\n"quantity": '   + str.tostring(tpQuantity) + ',' +
+         '\n"no_add": true,' +
+         '\n"orderType": "limit",' +
+         '\n"limitPrice": ' + str.tostring(enterLimitPrice) + '\n}'
+
+    alert(entryJson, alert.freq_once_per_bar_close)
+    if debugEnabled
+        log.info(entryJson)
+
+// ─────────────────────────────────────────────
+// TAKE PROFIT TRACKING
+// ─────────────────────────────────────────────
+var float tpPrice = na
+if strategy.position_size > 0 and strategy.position_size[1] == 0
+    tpPrice := strategy.position_avg_price * (1 + tpTp / 100)
+if strategy.position_size == 0
+    tpPrice := na
+
+// high updates every tick — fires the moment price touches TP intrabar
+tpHit = inTrade and not na(tpPrice) and high >= tpPrice
+
+// ─────────────────────────────────────────────
+// TRAILING STOP
+// Seeds from entry price on first bar so a gap-down open doesn't
+// place the trail floor below entry.
+// ─────────────────────────────────────────────
+var float highestPrice = na
+if strategy.position_size > 0 and strategy.position_size[1] == 0
+    highestPrice := math.max(strategy.position_avg_price, high)
+else if inTrade
+    highestPrice := math.max(highestPrice, high)
+else
+    highestPrice := na
+
+trailStop = highestPrice * (1 - trailPct)
+
+// ─────────────────────────────────────────────
+// PLOTS
+// ─────────────────────────────────────────────
+plot(pivotLevel, "Pivot",    color=color.new(color.blue,   0), linewidth=2, style=plot.style_stepline)
+plot(r1,         "R1",       color=color.new(color.red,   50), linewidth=1, style=plot.style_stepline)
+plot(r2,         "R2",       color=color.new(color.red,   70), linewidth=1, style=plot.style_stepline)
+plot(s1,         "S1",       color=color.new(color.green, 50), linewidth=1, style=plot.style_stepline)
+plot(s2,         "S2",       color=color.new(color.green, 70), linewidth=1, style=plot.style_stepline)
+plot(use5DMA ? ma5d : na,    "5D MA", color=color.orange, linewidth=1)
+
+plot(inTrade ? trailStop : na,                   "Trailing Stop", color=color.red,   linewidth=2)
+plot(inTrade and not na(tpPrice) ? tpPrice : na, "Take Profit",   color=color.green, linewidth=1, style=plot.style_linebr)
+
+// ATR% info table (top-right) — green when within gate, red when too volatile
+var table atrTable = table.new(position.top_right, 2, 2,
+     bgcolor=color.new(color.black, 70), border_color=color.new(color.gray, 60), border_width=1,
+     frame_color=color.new(color.gray, 80), frame_width=1)
+
+if barstate.islast
+    atrValColor = na(atrPct) ? color.gray :
+                  atrPct <= atrMaxPct ? color.new(color.green, 0) : color.new(color.red, 0)
+    atrLabel    = na(atrPct) ? "—" : str.tostring(atrPct, "#.##") + "%"
+    gateLabel   = "≤" + str.tostring(atrMaxPct, "#") + "% gate"
+    table.cell(atrTable, 0, 0, "ATR%",    text_color=color.gray,  text_size=size.small)
+    table.cell(atrTable, 1, 0, gateLabel, text_color=color.gray,  text_size=size.small)
+    table.cell(atrTable, 0, 1, atrLabel,  text_color=atrValColor, text_size=size.normal)
+    table.cell(atrTable, 1, 1, atrOk ? "✓ PASS" : "✗ SKIP",
+               text_color=atrValColor, text_size=size.small)
+
+// ─────────────────────────────────────────────
+// EXIT — real-time trail stop and TP, bar-close EOD
+//
+// Trail stop and TP use alert.freq_once_per_bar so they fire on the first
+// tick the condition becomes true. EOD stays bar-close (time-based, fires once).
+// ─────────────────────────────────────────────
+f_isEODExit() =>
+    time >= timestamp(syminfo.timezone, year, month, dayofmonth, eodHour, eodMinute)
+
+// Real-time checks — no barstate.isconfirmed, fires on the tick
+trailHit = inTrade and low  <= trailStop
+eodExit  = barstate.isconfirmed and closeEOD and inTrade and f_isEODExit()
+
+exitReason = tpHit    ? "tp"    :
+             trailHit ? "trail" :
+             eodExit  ? "eod"   : ""
+
+if exitReason != ""
+    strategy.close("Long")
+
+    // TP: limit at tpPrice when close >= tpPrice (full TP captured);
+    //     market when bar only wicked to TP — avoids dangling resting sell.
+    // Trail/EOD: always market.
+    exitJson = exitReason == "tp" and close >= tpPrice ?
+         '{"ticker": "' + syminfo.ticker + '",' +
+         '"action": "exit",' +
+         '"orderType": "limit",' +
+         '"limitPrice": ' + str.tostring(math.ceil(tpPrice * 100) / 100) + '}' :
+         '{"ticker": "' + syminfo.ticker + '",' +
+         '"action": "exit",' +
+         '"orderType": "market"}'
+
+    alert(exitJson, alert.freq_once_per_bar)
+    if debugEnabled
+        log.info("Exit reason=" + exitReason + " px=" + str.tostring(close) + " " + exitJson)
