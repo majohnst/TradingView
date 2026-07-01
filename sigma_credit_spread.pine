@@ -1,0 +1,217 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// 3σ Credit Spread Levels  [DayTraderOrganizer]
+// ══════════════════════════════════════════════════════════════════════════════
+// Computes intraday remaining-time σ bands from VIX and plots 1σ / 2σ / 3σ
+// levels on the chart.  The 3σ band is where a credit spread short leg sits
+// with ≈99.7% probability of expiring worthless.
+//
+// Use on SPX, XSP, NDX, DJX, RUT — any index with a VIX-family IV measure.
+// Intended timeframes: 1m, 5m, 15m intraday.
+//
+// Alerts:
+//   • "CS Window Open"       — 11:00 AM ET entry window opens (scan Bullseye)
+//   • "CS Sweet Spot"        — 1:00 PM ET last-good-entry reminder
+//   • "Near 3σ Upper/Lower"  — price within X% of the short-call/put zone
+//   • "3σ Upper/Lower Breach"— price crossed 3σ; avoid new entries on that side
+//
+// Add to TradingView as an add-on indicator alongside the GEX + Busby indicator.
+// Set alerts for "Near 3σ (any)" and "CS Window Open" to get entry-time pings.
+// ══════════════════════════════════════════════════════════════════════════════
+//@version=5
+indicator("3σ Credit Spread [DTO]", overlay=true,
+          max_lines_count=10, max_labels_count=30)
+
+// ─── Inputs ───────────────────────────────────────────────────────────────────
+var G_IV   = "Volatility"
+var G_DISP = "Display"
+var G_WIN  = "Entry Window"
+var G_ALT  = "Alerts"
+
+iv_sym      = input.symbol("CBOE:VIX",
+                "VIX symbol",
+                group=G_IV,
+                tooltip="Normally CBOE:VIX for SPX/XSP/DJX; change to CBOE:VXN for NDX")
+iv_override = input.float(0.0,
+                "Manual IV % (0 = live VIX)",
+                minval=0, maxval=200, step=0.5,
+                group=G_IV,
+                tooltip="Non-zero overrides the VIX feed (e.g. 16.5 for 16.5%)")
+
+anchor_type = input.string("Current Bar",
+                "Spot anchor",
+                options=["Current Bar", "Session Open"],
+                group=G_DISP,
+                tooltip="'Current Bar' uses live price as center (dynamic σ). 'Session Open' anchors σ to the 9:30 AM open — shows how much expected move is left from the open.")
+show_1s     = input.bool(true,  "Show 1σ band", group=G_DISP)
+show_2s     = input.bool(true,  "Show 2σ band", group=G_DISP)
+show_3s     = input.bool(true,  "Show 3σ band", group=G_DISP)
+show_table  = input.bool(true,  "Show info table (top-right)", group=G_DISP)
+strike_inc  = input.float(1.0,
+                "Strike increment",
+                minval=0.5, maxval=50, step=0.5,
+                group=G_DISP,
+                tooltip="Used to round 3σ to nearest tradable strike. XSP=$1, SPX=$5, NDX=$25, DJX=$1, RUT=$5")
+
+win_open_h  = input.int(11, "Window open  — hour ET",   minval=9,  maxval=14, group=G_WIN)
+win_open_m  = input.int( 0, "Window open  — minute ET", minval=0,  maxval=59, step=15, group=G_WIN)
+win_close_h = input.int(14, "Window close — hour ET",   minval=10, maxval=16, group=G_WIN)
+win_close_m = input.int(30, "Window close — minute ET", minval=0,  maxval=59, step=15, group=G_WIN)
+sweet_h     = input.int(13, "Sweet spot hour ET (last good entry reminder)", minval=10, maxval=15, group=G_WIN)
+sweet_m     = input.int( 0, "Sweet spot minute ET", minval=0, maxval=59, step=15, group=G_WIN)
+
+alert_pct   = input.float(0.30,
+                "Alert within % of 3σ",
+                minval=0.05, maxval=5.0, step=0.05,
+                group=G_ALT,
+                tooltip="Fire 'Near 3σ' alert when price is within this % of the 3σ strike zone")
+
+// ─── Time helpers (America/New_York) ─────────────────────────────────────────
+ET          = "America/New_York"
+et_h        = hour(time, ET)
+et_m        = minute(time, ET)
+et_min      = et_h * 60 + et_m
+
+OPEN_MIN    = 9  * 60 + 30     // 570   9:30 AM
+CLOSE_MIN   = 16 * 60          // 960   4:00 PM
+TRADING_HRS = 6.5
+
+is_rth      = et_min >= OPEN_MIN and et_min < CLOSE_MIN
+is_open_bar = et_min == OPEN_MIN
+mins_rem    = float(math.max(CLOSE_MIN - et_min, 1))
+hours_rem   = mins_rem / 60.0
+
+in_window   = et_min >= win_open_h  * 60 + win_open_m  and
+              et_min <= win_close_h * 60 + win_close_m and is_rth
+is_win_open = et_min == win_open_h  * 60 + win_open_m  and is_rth
+is_sweet    = et_min == sweet_h * 60 + sweet_m and is_rth
+
+// ─── Session-open anchor ─────────────────────────────────────────────────────
+var float open_price = na
+if is_open_bar or (is_rth and na(open_price))
+    open_price := close
+if not is_rth
+    open_price := na
+
+spot = anchor_type == "Session Open" ? nz(open_price, close) : close
+
+// ─── IV / VIX ────────────────────────────────────────────────────────────────
+vix_live = request.security(iv_sym, "D", close, ignore_invalid_symbol=true)
+iv       = iv_override > 0 ? iv_override / 100.0 : nz(vix_live, 16.0) / 100.0
+
+// ─── σ calculation ───────────────────────────────────────────────────────────
+// σ_remaining = spot × IV × √(hours_remaining / (TRADING_HRS × 252))
+sigma  = spot * iv * math.sqrt(hours_rem / (TRADING_HRS * 252.0))
+
+u1 = spot + 1.0 * sigma;  l1 = spot - 1.0 * sigma
+u2 = spot + 2.0 * sigma;  l2 = spot - 2.0 * sigma
+u3 = spot + 3.0 * sigma;  l3 = spot - 3.0 * sigma
+
+// Round to nearest tradable strike
+u3_strike = math.ceil(u3  / strike_inc) * strike_inc
+l3_strike = math.floor(l3 / strike_inc) * strike_inc
+
+// ─── Plots ───────────────────────────────────────────────────────────────────
+C1 = color.new(color.blue,   65)
+C2 = color.new(color.orange, 45)
+C3U = color.new(color.red,   20)
+C3L = color.new(color.lime,  20)
+
+p_u1 = plot(is_rth and show_1s ? u1 : na, "1σ Upper", C1,  1, plot.style_line)
+p_l1 = plot(is_rth and show_1s ? l1 : na, "1σ Lower", C1,  1, plot.style_line)
+p_u2 = plot(is_rth and show_2s ? u2 : na, "2σ Upper", C2,  1, plot.style_line)
+p_l2 = plot(is_rth and show_2s ? l2 : na, "2σ Lower", C2,  1, plot.style_line)
+p_u3 = plot(is_rth and show_3s ? u3 : na, "3σ Upper", C3U, 2, plot.style_line)
+p_l3 = plot(is_rth and show_3s ? l3 : na, "3σ Lower", C3L, 2, plot.style_line)
+
+// Soft fill between 2σ and 3σ (the short-leg zone)
+fill(p_u3, p_u2, color.new(color.red,  93), "3σ–2σ call zone")
+fill(p_l2, p_l3, color.new(color.lime, 93), "3σ–2σ put zone")
+
+// Entry window background tint
+bgcolor(in_window and is_rth ? color.new(color.teal, 92) : na, title="Entry window")
+
+// ─── Labels ──────────────────────────────────────────────────────────────────
+_fmt(v) =>
+    str.tostring(math.round(v, 2))
+
+// At window open: annotate the 3σ short-strike levels
+if is_win_open
+    label.new(bar_index, u3,
+              "SELL CALL ≥ " + _fmt(u3_strike) + "\n3σ upper · 1σ=" + _fmt(sigma),
+              style=label.style_label_down,
+              color=color.new(color.red, 10), textcolor=color.white, size=size.small)
+    label.new(bar_index, l3,
+              "SELL PUT ≤ " + _fmt(l3_strike) + "\n3σ lower",
+              style=label.style_label_up,
+              color=color.new(color.lime, 10), textcolor=color.black, size=size.small)
+
+// At sweet spot: last-chance reminder with updated levels
+if is_sweet
+    label.new(bar_index, u3,
+              "⏰ Last entry\nCALL ≥ " + _fmt(u3_strike) + "  PUT ≤ " + _fmt(l3_strike),
+              style=label.style_label_left,
+              color=color.new(color.teal, 10), textcolor=color.white, size=size.small)
+
+// ─── Info table ──────────────────────────────────────────────────────────────
+if show_table and is_rth and barstate.islast
+    var tbl = table.new(position.top_right, 2, 7,
+                        bgcolor=color.new(color.black, 55),
+                        border_color=color.new(color.gray, 40), border_width=1,
+                        frame_color=color.new(color.gray, 30), frame_width=1)
+
+    _r(col, row, txt, clr) =>
+        table.cell(tbl, col, row, txt, text_color=clr, text_size=size.small,
+                   bgcolor=color.new(color.black, 55))
+
+    win_lbl  = in_window ? "● WINDOW ACTIVE" : (et_min < win_open_h * 60 + win_open_m ? "before window" : "window closed")
+    win_clr  = in_window ? color.lime : color.gray
+    hrs_clr  = hours_rem < 2.0 ? color.orange : (hours_rem < 3.5 ? color.yellow : color.white)
+
+    _r(0, 0, "3σ Credit Spread",                 color.white)
+    _r(1, 0, win_lbl,                             win_clr)
+    _r(0, 1, "Spot",                              color.gray)
+    _r(1, 1, _fmt(spot),                          color.white)
+    _r(0, 2, "1σ remaining",                      color.gray)
+    _r(1, 2, _fmt(sigma),                         color.new(color.blue, 20))
+    _r(0, 3, "3σ CALL short",                     color.gray)
+    _r(1, 3, _fmt(u3_strike),                     color.red)
+    _r(0, 4, "3σ PUT short",                      color.gray)
+    _r(1, 4, _fmt(l3_strike),                     color.lime)
+    _r(0, 5, "Hours left",                        color.gray)
+    _r(1, 5, str.tostring(math.round(hours_rem, 1)) + "h",  hrs_clr)
+    _r(0, 6, "IV (VIX %)",                        color.gray)
+    _r(1, 6, str.tostring(math.round(iv * 100, 1)) + "%",   color.yellow)
+
+// ─── Alert conditions ────────────────────────────────────────────────────────
+near_u3   = is_rth and close >= u3 * (1.0 - alert_pct / 100.0) and close < u3
+near_l3   = is_rth and close <= l3 * (1.0 + alert_pct / 100.0) and close > l3
+breach_u3 = is_rth and close >= u3
+breach_l3 = is_rth and close <= l3
+
+alertcondition(is_win_open,
+    "CS Window Open",
+    "3σ credit spread window opened — check Bullseye and scan for entry")
+
+alertcondition(is_sweet,
+    "CS Sweet Spot",
+    "1 PM ET sweet spot — last good entry for 0DTE 3σ credit spread, check live credit")
+
+alertcondition(near_u3 and in_window,
+    "Near 3σ Upper (window)",
+    "Price approaching 3σ CALL zone within entry window — review credit spread entry")
+
+alertcondition(near_l3 and in_window,
+    "Near 3σ Lower (window)",
+    "Price approaching 3σ PUT zone within entry window — review credit spread entry")
+
+alertcondition(near_u3 or near_l3,
+    "Near 3σ (any)",
+    "Price near 3σ band — check Bullseye credit spread card for live credit")
+
+alertcondition(breach_u3,
+    "3σ Upper Breached",
+    "⚠ Price crossed ABOVE 3σ upper — avoid new call spread entries, monitor existing")
+
+alertcondition(breach_l3,
+    "3σ Lower Breached",
+    "⚠ Price crossed BELOW 3σ lower — avoid new put spread entries, monitor existing")
